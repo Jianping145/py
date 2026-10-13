@@ -1,26 +1,34 @@
 # -*- coding: utf-8 -*-
-# 洛雪TV_蜂蜜影视 - 适配真实站点 API
+# 洛雪TV - 蜂蜜影视/Fongmi 爬虫
 # 网站: https://tv.lxyy.club/
-# 列表: ranking / quark / TMDB discover 二级分类
-# 播放: /api/proxy.php 采集源直链 m3u8
+# 列表: ranking / quark / TMDB discover
+# 播放: 采集源直链 + 公共解析（洛雪4K需网页授权，App不可用）
 
-import requests
 import json
+import re
+import ssl
+import time
 from urllib.parse import quote, unquote, urljoin, urlencode
+from urllib.request import Request, urlopen, build_opener, HTTPSHandler, install_opener
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except Exception:
+    HAS_REQUESTS = False
+
 
 class Spider:
-
     def __init__(self):
         self.site_url = "https://tv.lxyy.club"
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": self.site_url,
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": self.site_url + "/",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         self.tmdb_img = "https://image.tmdb.org/t/p/w500"
         self.source_priority = ["jl", "mj", "qilin", "360zy", "dytt", "ik", "md", "fy"]
-        # 解析线路（与网页 official_routes 对齐，启动后可从接口刷新）
         self.parse_routes = [
             {"id": "official_default", "name": "默认解析", "type": "iframe",
              "api": "https://svip.qlplayer.cyou/?url="},
@@ -28,16 +36,8 @@ class Spider:
              "api": "https://bfq.txnp.cn/excessive?url="},
             {"id": "official_muh2ffwq", "name": "m1907", "type": "iframe",
              "api": "https://im1907.top/?jx="},
-            {"id": "official_musbpyqz", "name": "洛雪4K", "type": "json",
-             "api": "/json-player.php?route=official_musbpyqz&url="},
-            {"id": "official_muh2fkp2", "name": "备用", "type": "json",
-             "api": "/json-player.php?route=official_muh2fkp2&url="},
-            {"id": "official_mv49v5qz", "name": "备用2", "type": "json",
-             "api": "/json-player.php?route=official_mv49v5qz&url="},
         ]
         self._parse_routes_loaded = False
-
-        # 一级分类
         self.primary = [
             ("recommend", "推荐"),
             ("movie", "电影"),
@@ -49,11 +49,22 @@ class Spider:
             ("quark_动漫", "夸克·动漫"),
             ("quark_短剧", "夸克·短剧"),
         ]
-
-        # 二级分类（与站点 CESHI_CATALOG_LISTS 一致）
-        # id -> {group, name, endpoint, params, countries}
         self.catalog = {}
         self._init_catalog()
+        # 忽略 SSL 证书问题（部分设备缺根证书）
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            install_opener(build_opener(HTTPSHandler(context=ctx)))
+        except Exception:
+            pass
+
+    def init(self, extend=""):
+        return
+
+    def getName(self):
+        return "洛雪TV"
 
     def _init_catalog(self):
         movie_base = {
@@ -83,7 +94,6 @@ class Spider:
                 "media_type": mt,
             }
 
-        # 电影
         add("movie", "movie-all", "全部")
         add("movie", "movie-popular", "热门")
         add("movie", "movie-latest", "最新", params={"sort_by": "primary_release_date.desc"})
@@ -101,7 +111,6 @@ class Spider:
         add("movie", "movie-animation", "动画", params={"with_genres": "16"})
         add("movie", "movie-documentary", "纪录片", params={"with_genres": "99"})
 
-        # 剧集
         add("series", "series-all", "全部")
         add("series", "series-hot", "热播")
         add("series", "series-latest", "最新", params={"sort_by": "first_air_date.desc"})
@@ -119,7 +128,6 @@ class Spider:
         add("series", "series-documentary", "纪录片", params={"with_genres": "99"})
         add("series", "western-animation", "英文动画", params={"with_genres": "16", "with_original_language": "en"})
 
-        # 动漫（走 discover/tv + 动画类型）
         add("anime", "anime-all", "全部", params={"with_genres": "16"})
         add("anime", "anime-cn", "国漫", params={"with_genres": "16", "with_original_language": "zh", "with_origin_country": "CN"})
         add("anime", "anime-japan", "日漫", params={"with_genres": "16", "with_origin_country": "JP"})
@@ -127,20 +135,45 @@ class Spider:
         add("anime", "anime-latest", "最新", params={"with_genres": "16", "sort_by": "first_air_date.desc"})
         add("anime", "anime-rated", "高分", params={"with_genres": "16", "sort_by": "vote_average.desc", "vote_count.gte": "100"})
 
-    def fetch(self, url, timeout=15, method="GET", data=None):
-        try:
-            if method == "POST":
-                resp = requests.post(url, headers=self.headers, json=data, timeout=timeout, verify=False)
-            else:
-                resp = requests.get(url, headers=self.headers, timeout=timeout, verify=False)
-            resp.encoding = "utf-8"
-            if resp.status_code == 200:
-                return resp.text
-        except Exception as e:
-            print(f"[FETCH ERROR] {url}: {e}")
+    # ---------- HTTP ----------
+    def fetch(self, url, timeout=12, method="GET", data=None, retries=2):
+        last_err = None
+        for i in range(retries + 1):
+            try:
+                if HAS_REQUESTS:
+                    if method == "POST":
+                        resp = requests.post(
+                            url, headers=self.headers, json=data,
+                            timeout=timeout, verify=False,
+                        )
+                    else:
+                        resp = requests.get(
+                            url, headers=self.headers,
+                            timeout=timeout, verify=False,
+                        )
+                    resp.encoding = "utf-8"
+                    if resp.status_code == 200 and resp.text:
+                        return resp.text
+                    last_err = f"status={resp.status_code}"
+                else:
+                    body = None
+                    if method == "POST":
+                        body = json.dumps(data or {}).encode("utf-8")
+                        req = Request(url, data=body, headers={
+                            **self.headers,
+                            "Content-Type": "application/json",
+                        })
+                    else:
+                        req = Request(url, headers=self.headers)
+                    with urlopen(req, timeout=timeout) as resp:
+                        return resp.read().decode("utf-8", errors="ignore")
+            except Exception as e:
+                last_err = e
+                time.sleep(0.4 * (i + 1))
+        print(f"[FETCH ERROR] {url}: {last_err}")
         return ""
 
-    def fetch_json(self, url, timeout=15, method="GET", data=None):
+    def fetch_json(self, url, timeout=12, method="GET", data=None):
         text = self.fetch(url, timeout, method, data)
         if not text:
             return {}
@@ -148,6 +181,9 @@ class Spider:
             return json.loads(text)
         except Exception:
             return {}
+
+    def ok_json(self, obj):
+        return json.dumps(obj, ensure_ascii=False)
 
     def tmdb_poster(self, path):
         if not path:
@@ -162,7 +198,7 @@ class Spider:
             tmdb_id = str(item.get("tmdbId") or item.get("id") or "")
             media = item.get("mediaType") or "movie"
             pic = self.tmdb_poster(item.get("posterPath") or "")
-            remarks = f"{item.get('people', '')}人在看" if item.get("people") else media
+            remarks = f"{item.get('people', '')}人在看" if item.get("people") else str(media)
             vod_id = f"tmdb_{media}_{tmdb_id}"
         elif source == "quark":
             title = item.get("title") or ""
@@ -177,20 +213,25 @@ class Spider:
             cid = str(item.get("id") or "")
             vod_id = f"col_{src}_{cid}"
         elif source == "tmdb_discover":
-            media = item.get("media_type") or ("tv" if item.get("name") else "movie")
-            # discover/movie 没有 media_type 字段
-            if "title" in item and "name" not in item:
+            if item.get("media_type"):
+                media = item.get("media_type")
+            elif "title" in item and "name" not in item:
                 media = "movie"
-            elif "name" in item and "title" not in item:
+            elif "name" in item:
                 media = "tv"
+            else:
+                media = "movie"
             title = item.get("title") or item.get("name") or ""
             tmdb_id = str(item.get("id") or "")
             pic = self.tmdb_poster(item.get("poster_path") or "")
             remarks = item.get("release_date") or item.get("first_air_date") or ""
-            if item.get("vote_average"):
-                remarks = f"★{round(float(item.get('vote_average')), 1)}"
+            try:
+                if item.get("vote_average"):
+                    remarks = f"★{round(float(item.get('vote_average')), 1)}"
+            except Exception:
+                pass
             vod_id = f"tmdb_{media}_{tmdb_id}"
-        else:  # tmdb search
+        else:
             media = item.get("media_type") or ("tv" if item.get("name") else "movie")
             title = item.get("title") or item.get("name") or ""
             tmdb_id = str(item.get("id") or "")
@@ -201,46 +242,51 @@ class Spider:
             vod_id = f"tmdb_{media}_{tmdb_id}"
 
         return {
-            "vod_id": vod_id,
-            "vod_name": title,
-            "vod_pic": pic,
+            "vod_id": str(vod_id),
+            "vod_name": str(title),
+            "vod_pic": str(pic),
             "vod_remarks": str(remarks),
         }
 
     def collect_search(self, keyword, page=1):
-        url = f"{self.site_url}/api/proxy.php?action=search&wd={quote(keyword)}&page={page}"
+        url = f"{self.site_url}/api/proxy.php?action=search&wd={quote(str(keyword))}&page={page}"
         data = self.fetch_json(url)
         return data.get("results") or []
 
     def collect_detail(self, source, cid):
-        url = f"{self.site_url}/api/proxy.php?action=detail&source={quote(str(source))}&id={quote(str(cid))}"
+        url = (
+            f"{self.site_url}/api/proxy.php?action=detail"
+            f"&source={quote(str(source))}&id={quote(str(cid))}"
+        )
         data = self.fetch_json(url)
         details = data.get("details") or []
         return details[0] if details else {}
 
     def load_parse_routes(self):
-        """从站点配置刷新解析线路"""
         if self._parse_routes_loaded:
             return
         data = self.fetch_json(f"{self.site_url}/api/proxy.php?action=config")
         routes = data.get("official_routes") or []
-        if routes:
-            parsed = []
-            for r in routes:
-                api = (r.get("api") or "").strip()
-                name = (r.get("name") or "").strip()
-                if not api or not name:
-                    continue
-                parsed.append({
-                    "id": r.get("id") or name,
-                    "name": name,
-                    "type": r.get("type") or "iframe",
-                    "api": api,
-                    "official_only": bool(r.get("official_only")),
-                    "player_codes": r.get("player_codes") or [],
-                })
-            if parsed:
-                self.parse_routes = parsed
+        parsed = []
+        for r in routes:
+            api = (r.get("api") or "").strip()
+            name = (r.get("name") or "").strip()
+            if not api or not name:
+                continue
+            rtype = (r.get("type") or "iframe").lower()
+            # 站内 json/官方限定解析需要网页 authorization，App 不可用
+            if rtype == "json" or r.get("official_only"):
+                continue
+            if not api.startswith("http"):
+                continue
+            parsed.append({
+                "id": r.get("id") or name,
+                "name": name,
+                "type": rtype,
+                "api": api,
+            })
+        if parsed:
+            self.parse_routes = parsed
         self._parse_routes_loaded = True
 
     def abs_api(self, api):
@@ -254,7 +300,7 @@ class Spider:
         low = (url or "").lower()
         return any(x in low for x in [
             "v.qq.com", "iqiyi.com", "youku.com", "mgtv.com",
-            "bilibili.com", "b23.tv", "ixigua.com", "pptv.com", "le.com"
+            "bilibili.com", "b23.tv", "ixigua.com", "pptv.com",
         ])
 
     def is_direct_video(self, url):
@@ -265,30 +311,25 @@ class Spider:
         api = self.abs_api(route.get("api") or "")
         if not api:
             return raw_url
-        # api 已含 url= 后缀
-        if api.endswith("url=") or api.endswith("jx=") or api.endswith("url="):
+        if api.endswith("url=") or api.endswith("jx="):
             return api + quote(raw_url, safe="")
         sep = "&" if "?" in api else "?"
         return f"{api}{sep}url={quote(raw_url, safe='')}"
 
     def expand_with_parsers(self, flag, eps_joined):
-        """仅对官网页面链接展开解析线路；直链采集源保持单条"""
         self.load_parse_routes()
         if not eps_joined:
             return []
         first = eps_joined.split("#")[0]
         sample = first.split("$")[-1] if "$" in first else first
 
-        # 直链 m3u8/mp4：不展开
         if self.is_direct_video(sample) and not self.is_official_page(sample):
             return [(flag, eps_joined)]
 
-        # 官网播放页：按全部解析接口展开
         if self.is_official_page(sample):
             out = []
             for route in self.parse_routes:
                 rname = route.get("name") or "解析"
-                new_flag = f"{flag}·{rname}"
                 new_eps = []
                 for ep in eps_joined.split("#"):
                     if not ep:
@@ -299,30 +340,11 @@ class Spider:
                         name, url = "正片", ep
                     new_eps.append(f"{name}${self.build_parse_url(route, url)}")
                 if new_eps:
-                    out.append((new_flag, "#".join(new_eps)))
+                    out.append((f"{flag}·{rname}", "#".join(new_eps)))
             out.append((f"{flag}·原链", eps_joined))
             return out
 
-        # 未知链接：保留原链 + 全解析展开
-        out = [(flag, eps_joined)]
-        for route in self.parse_routes:
-            rname = route.get("name") or "解析"
-            new_flag = f"{flag}·{rname}"
-            new_eps = []
-            for ep in eps_joined.split("#"):
-                if not ep:
-                    continue
-                if "$" in ep:
-                    name, url = ep.split("$", 1)
-                else:
-                    name, url = "正片", ep
-                if self.is_direct_video(url) and not self.is_official_page(url):
-                    new_eps.append(f"{name}${url}")
-                else:
-                    new_eps.append(f"{name}${self.build_parse_url(route, url)}")
-            if new_eps:
-                out.append((new_flag, "#".join(new_eps)))
-        return out
+        return [(flag, eps_joined)]
 
     def platform_label(self, url, fallback="官方"):
         u = (url or "").lower()
@@ -336,23 +358,18 @@ class Spider:
             return "优酷"
         if "mgtv.com" in u:
             return "芒果TV"
-        if "ixigua.com" in u:
-            return "西瓜视频"
         return fallback
 
     def build_play_lists(self, detail, source_name="", source_key=""):
-        """从单个采集详情提取多条线路，返回 [(flag, eps_joined), ...]"""
         lines = []
         episodes_groups = detail.get("episodes") or []
         if not episodes_groups:
-            # 兼容 play_url 字段
             raw = detail.get("play_url") or ""
             if raw and isinstance(raw, str) and "$" in raw:
                 lines.append((source_name or source_key or "默认", raw.replace("$$$", "#")))
             return lines
 
         first = episodes_groups[0] if episodes_groups else {}
-        # 扁平单线路
         if isinstance(first, dict) and "url" in first and "episodes" not in first:
             flag = source_name or source_key or "默认"
             eps = []
@@ -382,37 +399,30 @@ class Spider:
                 continue
             flag = group.get("name") or group.get("flag") or ""
             if not flag or flag in ("None", "null"):
-                # 官采按平台拆分命名
-                if source_key == "qilin" or (source_name and "官采" in source_name):
-                    flag = self.platform_label(sample_url, source_name or f"官方{idx+1}")
+                if source_key == "qilin" or (source_name and "官采" in str(source_name)):
+                    flag = self.platform_label(sample_url, source_name or f"官方{idx + 1}")
                 else:
-                    flag = source_name or source_key or f"线路{idx+1}"
+                    flag = source_name or source_key or f"线路{idx + 1}"
             else:
-                # 避免多源同名混淆
-                if source_name and source_name not in str(flag):
+                if source_name and str(source_name) not in str(flag):
                     flag = f"{source_name}·{flag}"
             lines.append((str(flag), "#".join(eps)))
         return lines
 
     def pick_collect_rows(self, title):
-        """按源去重，优先精确片名，覆盖全部采集站"""
         results = self.collect_search(title)
         if not results:
             return []
         exact = [r for r in results if (r.get("name") or "").strip() == title.strip()]
-        # 次优：标题包含或被包含（去掉空格）
         t = title.strip().replace(" ", "")
         fuzzy = []
         if not exact:
             for r in results:
                 n = (r.get("name") or "").strip().replace(" ", "")
-                if not n:
-                    continue
-                if n == t or t in n or n in t:
+                if n and (n == t or t in n or n in t):
                     fuzzy.append(r)
         pool = exact if exact else (fuzzy if fuzzy else results)
 
-        # 每个 source 只保留一条（优先精确且 remarks 更好的）
         by_src = {}
         for r in pool:
             src = r.get("source") or ""
@@ -427,13 +437,12 @@ class Spider:
             remarks = r.get("remarks") or ""
             if any(x in remarks for x in ("正片", "HD", "完结", "全")):
                 score += 5
-            if "解说" in name or "解读" in name or "预告" in name:
+            if any(x in name for x in ("解说", "解读", "预告")):
                 score -= 50
             prev = by_src.get(src)
             if not prev or score > prev[0]:
                 by_src[src] = (score, r)
 
-        # 按站点优先级排序
         ordered = []
         for src in self.source_priority:
             if src in by_src:
@@ -443,22 +452,15 @@ class Spider:
         return ordered
 
     def tmdb_discover(self, catalog_id, page=1):
-        """按二级分类拉取 TMDB discover 列表"""
         conf = self.catalog.get(catalog_id)
         if not conf:
             return [], 1
-
         params = dict(conf["params"])
         params["page"] = str(page)
         params["language"] = "zh-CN"
-
-        # 多国家：简化为 with_origin_country 管道拼接
         countries = conf.get("countries")
         if countries:
             params["with_origin_country"] = "|".join(countries)
-
-        # 站点代理要求 path 单独传，其它参数作为 query
-        # 例: /api/tmdb.php?path=/discover/movie&sort_by=popularity.desc&page=1
         endpoint = conf["endpoint"]
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
@@ -479,243 +481,261 @@ class Spider:
                 vals.append({"n": conf["name"], "v": cid})
         return vals
 
-    # ========== 标准接口 ==========
-
-    def homeContent(self, filter):
-        classes = [{"type_id": tid, "type_name": name} for tid, name in self.primary]
-
-        # 二级筛选（App 支持 filter 时显示）
-        filters = {
-            "movie": [{
-                "key": "cate",
-                "name": "分类",
-                "value": self.filter_values_for_group("movie"),
-            }],
-            "series": [{
-                "key": "cate",
-                "name": "分类",
-                "value": self.filter_values_for_group("series"),
-            }],
-            "anime": [{
-                "key": "cate",
-                "name": "分类",
-                "value": self.filter_values_for_group("anime"),
-            }],
-        }
-
-        data = self.fetch_json(f"{self.site_url}/api/ranking.php")
-        videos = [self.item_to_vod(item, "ranking") for item in (data.get("items") or [])[:30]]
-        return json.dumps({"class": classes, "filters": filters, "list": videos}, ensure_ascii=False)
-
-    def homeVideoContent(self):
-        data = self.fetch_json(f"{self.site_url}/api/ranking.php")
-        videos = [self.item_to_vod(item, "ranking") for item in (data.get("items") or [])[:40]]
-        return json.dumps({"list": videos}, ensure_ascii=False)
-
-    def categoryContent(self, tid, pg, filter, extend):
-        page = int(pg) if str(pg).isdigit() else 1
-        videos = []
-        pagecount = 1
-        total = 0
-
-        # extend 可能是 JSON 字符串或 dict
+    def _parse_extend(self, extend):
+        if isinstance(extend, dict):
+            return extend
+        if not extend:
+            return {}
         if isinstance(extend, str):
             try:
-                extend = json.loads(extend) if extend else {}
+                obj = json.loads(extend)
+                return obj if isinstance(obj, dict) else {}
             except Exception:
-                extend = {}
-        if not isinstance(extend, dict):
-            extend = {}
+                return {}
+        return {}
 
-        cate = extend.get("cate") or ""
-
-        # 1) 推荐
-        if tid == "recommend":
+    # ---------- 蜂蜜影视接口 ----------
+    def homeContent(self, filter):
+        try:
+            classes = [{"type_id": tid, "type_name": name} for tid, name in self.primary]
+            filters = {
+                "movie": [{"key": "cate", "name": "分类", "value": self.filter_values_for_group("movie")}],
+                "series": [{"key": "cate", "name": "分类", "value": self.filter_values_for_group("series")}],
+                "anime": [{"key": "cate", "name": "分类", "value": self.filter_values_for_group("anime")}],
+            }
+            videos = []
             data = self.fetch_json(f"{self.site_url}/api/ranking.php")
-            all_v = [self.item_to_vod(item, "ranking") for item in (data.get("items") or [])]
-            page_size = 20
-            start = (page - 1) * page_size
-            videos = all_v[start:start + page_size]
-            total = len(all_v)
-            pagecount = max(1, (total + page_size - 1) // page_size)
+            for item in (data.get("items") or [])[:30]:
+                videos.append(self.item_to_vod(item, "ranking"))
+            # 兜底：推荐为空时用夸克电视剧
+            if not videos:
+                data = self.fetch_json(
+                    f"{self.site_url}/api/quark-ranking.php?channel={quote('电视剧')}&limit=30"
+                )
+                for item in (data.get("items") or [])[:30]:
+                    videos.append(self.item_to_vod(item, "quark"))
+            return self.ok_json({"class": classes, "filters": filters, "list": videos})
+        except Exception as e:
+            print(f"[homeContent] {e}")
+            return self.ok_json({"class": [{"type_id": "recommend", "type_name": "推荐"}], "list": []})
 
-        # 2) 夸克榜
-        elif str(tid).startswith("quark_"):
-            channel = str(tid).replace("quark_", "", 1)
-            url = f"{self.site_url}/api/quark-ranking.php?channel={quote(channel)}&limit=60"
-            data = self.fetch_json(url)
-            all_v = [self.item_to_vod(item, "quark") for item in (data.get("items") or [])]
-            page_size = 20
-            start = (page - 1) * page_size
-            videos = all_v[start:start + page_size]
-            total = len(all_v)
-            pagecount = max(1, (total + page_size - 1) // page_size)
+    def homeVideoContent(self):
+        try:
+            data = self.fetch_json(f"{self.site_url}/api/ranking.php")
+            videos = [self.item_to_vod(item, "ranking") for item in (data.get("items") or [])[:40]]
+            if not videos:
+                data = self.fetch_json(
+                    f"{self.site_url}/api/quark-ranking.php?channel={quote('电影')}&limit=40"
+                )
+                videos = [self.item_to_vod(item, "quark") for item in (data.get("items") or [])[:40]]
+            return self.ok_json({"list": videos})
+        except Exception as e:
+            print(f"[homeVideoContent] {e}")
+            return self.ok_json({"list": []})
 
-        # 3) 电影 / 剧集 / 动漫 + 二级分类
-        elif tid in ("movie", "series", "anime") or tid in self.catalog:
-            catalog_id = cate if cate in self.catalog else tid
-            if catalog_id not in self.catalog:
-                # 一级入口默认「全部」
-                defaults = {"movie": "movie-all", "series": "series-all", "anime": "anime-all"}
-                catalog_id = defaults.get(tid, "movie-all")
-            results, total_pages = self.tmdb_discover(catalog_id, page)
-            videos = [self.item_to_vod(item, "tmdb_discover") for item in results]
-            pagecount = max(1, min(int(total_pages), 500))
-            total = pagecount * max(len(videos), 20)
+    def categoryContent(self, tid, pg, filter, extend):
+        try:
+            page = int(pg) if str(pg).isdigit() else 1
+            tid = str(tid or "recommend")
+            extend = self._parse_extend(extend)
+            cate = str(extend.get("cate") or "")
+            videos = []
+            pagecount = 1
+            total = 0
 
-        # 4) 兼容旧夸克频道名
-        elif tid in ("电影", "电视剧", "综艺", "动漫", "短剧"):
-            url = f"{self.site_url}/api/quark-ranking.php?channel={quote(tid)}&limit=60"
-            data = self.fetch_json(url)
-            all_v = [self.item_to_vod(item, "quark") for item in (data.get("items") or [])]
-            page_size = 20
-            start = (page - 1) * page_size
-            videos = all_v[start:start + page_size]
-            total = len(all_v)
-            pagecount = max(1, (total + page_size - 1) // page_size)
+            if tid == "recommend":
+                data = self.fetch_json(f"{self.site_url}/api/ranking.php")
+                all_v = [self.item_to_vod(item, "ranking") for item in (data.get("items") or [])]
+                page_size = 20
+                start = (page - 1) * page_size
+                videos = all_v[start:start + page_size]
+                total = len(all_v)
+                pagecount = max(1, (total + page_size - 1) // page_size)
 
-        return json.dumps({
-            "list": videos,
-            "page": page,
-            "pagecount": pagecount,
-            "limit": len(videos) or 20,
-            "total": total,
-        }, ensure_ascii=False)
+            elif tid.startswith("quark_"):
+                channel = tid.replace("quark_", "", 1)
+                url = f"{self.site_url}/api/quark-ranking.php?channel={quote(channel)}&limit=60"
+                data = self.fetch_json(url)
+                all_v = [self.item_to_vod(item, "quark") for item in (data.get("items") or [])]
+                page_size = 20
+                start = (page - 1) * page_size
+                videos = all_v[start:start + page_size]
+                total = len(all_v)
+                pagecount = max(1, (total + page_size - 1) // page_size)
+
+            elif tid in ("movie", "series", "anime") or tid in self.catalog:
+                catalog_id = cate if cate in self.catalog else tid
+                if catalog_id not in self.catalog:
+                    defaults = {"movie": "movie-all", "series": "series-all", "anime": "anime-all"}
+                    catalog_id = defaults.get(tid, "movie-all")
+                results, total_pages = self.tmdb_discover(catalog_id, page)
+                videos = [self.item_to_vod(item, "tmdb_discover") for item in results]
+                pagecount = max(1, min(int(total_pages), 500))
+                total = pagecount * max(len(videos), 20)
+
+            elif tid in ("电影", "电视剧", "综艺", "动漫", "短剧"):
+                url = f"{self.site_url}/api/quark-ranking.php?channel={quote(tid)}&limit=60"
+                data = self.fetch_json(url)
+                all_v = [self.item_to_vod(item, "quark") for item in (data.get("items") or [])]
+                page_size = 20
+                start = (page - 1) * page_size
+                videos = all_v[start:start + page_size]
+                total = len(all_v)
+                pagecount = max(1, (total + page_size - 1) // page_size)
+
+            return self.ok_json({
+                "list": videos,
+                "page": page,
+                "pagecount": pagecount,
+                "limit": len(videos) or 20,
+                "total": total,
+            })
+        except Exception as e:
+            print(f"[categoryContent] {e}")
+            return self.ok_json({"list": [], "page": 1, "pagecount": 1, "limit": 20, "total": 0})
 
     def detailContent(self, ids):
-        if not ids:
-            return json.dumps({"list": []}, ensure_ascii=False)
+        try:
+            if not ids:
+                return self.ok_json({"list": []})
+            # ids 可能是 list 或 逗号分隔字符串
+            if isinstance(ids, str):
+                ids = [x for x in ids.split(",") if x]
+            vod_id = str(ids[0])
+            title = ""
+            pic = ""
+            desc = ""
+            remarks = ""
+            all_lines = []
 
-        vod_id = str(ids[0])
-        title = ""
-        pic = ""
-        desc = ""
-        remarks = ""
-        all_lines = []  # [(flag, url_str), ...]
+            def merge_meta(detail):
+                nonlocal title, pic, desc, remarks
+                if not title:
+                    title = detail.get("name") or detail.get("title") or title
+                if not pic:
+                    pic = detail.get("pic") or pic
+                if not desc:
+                    desc = detail.get("content") or detail.get("blurb") or desc
+                if not remarks:
+                    remarks = detail.get("remarks") or remarks
 
-        def merge_detail_meta(detail):
-            nonlocal title, pic, desc, remarks
-            if not title:
-                title = detail.get("name") or detail.get("title") or title
-            if not pic:
-                pic = detail.get("pic") or pic
-            if not desc:
-                desc = detail.get("content") or detail.get("blurb") or desc
-            if not remarks:
-                remarks = detail.get("remarks") or remarks
-
-        # 1) 采集源直达
-        if vod_id.startswith("col_"):
-            parts = vod_id.split("_", 2)
-            if len(parts) >= 3:
-                source, cid = parts[1], parts[2]
-                detail = self.collect_detail(source, cid)
-                if detail:
-                    merge_detail_meta(detail)
-                    src_name = detail.get("source_name") or source
-                    all_lines.extend(self.build_play_lists(detail, src_name, source))
-                    # 用片名再补全其它源
-                    if title:
-                        for row in self.pick_collect_rows(title):
-                            s2, id2 = row.get("source"), row.get("id")
-                            if not s2 or not id2:
-                                continue
-                            if s2 == source and str(id2) == str(cid):
-                                continue
-                            d2 = self.collect_detail(s2, id2)
-                            if not d2:
-                                continue
-                            merge_detail_meta(d2)
-                            all_lines.extend(self.build_play_lists(d2, d2.get("source_name") or row.get("source_name") or s2, s2))
-
-        # 2) TMDB / 夸克：标题 -> 全部采集源
-        else:
-            if vod_id.startswith("quark_"):
-                title = unquote(vod_id.replace("quark_", "", 1))
-            elif vod_id.startswith("tmdb_"):
+            if vod_id.startswith("col_"):
                 parts = vod_id.split("_", 2)
-                if len(parts) == 3:
-                    media, tmdb_id = parts[1], parts[2]
-                    path = f"/{media}/{tmdb_id}"
-                    data = self.fetch_json(f"{self.site_url}/api/tmdb.php?path={path}&language=zh-CN")
-                    if data:
-                        title = data.get("title") or data.get("name") or ""
-                        pic = self.tmdb_poster(data.get("poster_path") or "")
-                        desc = data.get("overview") or ""
+                if len(parts) >= 3:
+                    source, cid = parts[1], parts[2]
+                    detail = self.collect_detail(source, cid)
+                    if detail:
+                        merge_meta(detail)
+                        src_name = detail.get("source_name") or source
+                        all_lines.extend(self.build_play_lists(detail, src_name, source))
+                        if title:
+                            for row in self.pick_collect_rows(title):
+                                s2, id2 = row.get("source"), row.get("id")
+                                if not s2 or not id2:
+                                    continue
+                                if s2 == source and str(id2) == str(cid):
+                                    continue
+                                d2 = self.collect_detail(s2, id2)
+                                if not d2:
+                                    continue
+                                merge_meta(d2)
+                                all_lines.extend(self.build_play_lists(
+                                    d2, d2.get("source_name") or row.get("source_name") or s2, s2
+                                ))
             else:
-                title = vod_id
+                if vod_id.startswith("quark_"):
+                    title = unquote(vod_id.replace("quark_", "", 1))
+                elif vod_id.startswith("tmdb_"):
+                    parts = vod_id.split("_", 2)
+                    if len(parts) == 3:
+                        media, tmdb_id = parts[1], parts[2]
+                        path = f"/{media}/{tmdb_id}"
+                        data = self.fetch_json(
+                            f"{self.site_url}/api/tmdb.php?path={path}&language=zh-CN"
+                        )
+                        if data:
+                            title = data.get("title") or data.get("name") or ""
+                            pic = self.tmdb_poster(data.get("poster_path") or "")
+                            desc = data.get("overview") or ""
+                else:
+                    title = vod_id
 
-            if title:
-                rows = self.pick_collect_rows(title)
-                for row in rows:
-                    s2, id2 = row.get("source"), row.get("id")
-                    if not s2 or not id2:
-                        continue
-                    d2 = self.collect_detail(s2, id2)
-                    if not d2:
-                        continue
-                    merge_detail_meta(d2)
-                    all_lines.extend(self.build_play_lists(d2, d2.get("source_name") or row.get("source_name") or s2, s2))
+                if title:
+                    for row in self.pick_collect_rows(title):
+                        s2, id2 = row.get("source"), row.get("id")
+                        if not s2 or not id2:
+                            continue
+                        d2 = self.collect_detail(s2, id2)
+                        if not d2:
+                            continue
+                        merge_meta(d2)
+                        all_lines.extend(self.build_play_lists(
+                            d2, d2.get("source_name") or row.get("source_name") or s2, s2
+                        ))
 
-        # 官网链接按解析接口展开，再去重
-        expanded = []
-        for flag, eps in all_lines:
-            if not eps:
-                continue
-            expanded.extend(self.expand_with_parsers(flag, eps))
+            expanded = []
+            for flag, eps in all_lines:
+                if eps:
+                    expanded.extend(self.expand_with_parsers(flag, eps))
 
-        seen_flags = set()
-        play_from, play_url = [], []
-        for flag, eps in expanded:
-            if not eps:
-                continue
-            base = flag
-            n = 1
-            while flag in seen_flags:
-                n += 1
-                flag = f"{base}{n}"
-            seen_flags.add(flag)
-            play_from.append(flag)
-            play_url.append(eps)
+            seen = set()
+            play_from, play_url = [], []
+            for flag, eps in expanded:
+                if not eps:
+                    continue
+                base = flag
+                n = 1
+                while flag in seen:
+                    n += 1
+                    flag = f"{base}{n}"
+                seen.add(flag)
+                play_from.append(flag)
+                play_url.append(eps)
 
-        if not play_from:
-            play_from = ["暂无线路"]
-            play_url = ["暂无$http://127.0.0.1/none"]
+            if not play_from:
+                play_from = ["暂无线路"]
+                play_url = ["暂无$http://127.0.0.1/none"]
 
-        vod = {
-            "vod_id": vod_id,
-            "vod_name": title or vod_id,
-            "vod_pic": pic,
-            "vod_remarks": remarks,
-            "vod_content": desc,
-            "vod_play_from": "$$$".join(play_from),
-            "vod_play_url": "$$$".join(play_url),
-        }
-        return json.dumps({"list": [vod]}, ensure_ascii=False)
+            vod = {
+                "vod_id": vod_id,
+                "vod_name": title or vod_id,
+                "vod_pic": pic,
+                "vod_remarks": remarks,
+                "vod_content": desc,
+                "vod_play_from": "$$$".join(play_from),
+                "vod_play_url": "$$$".join(play_url),
+            }
+            return self.ok_json({"list": [vod]})
+        except Exception as e:
+            print(f"[detailContent] {e}")
+            return self.ok_json({"list": []})
 
-
-    def searchContent(self, key, quick):
-        videos = []
-        for item in self.collect_search(key):
-            videos.append(self.item_to_vod(item, "collect"))
-        data = self.fetch_json(
-            f"{self.site_url}/api/tmdb.php?path=/search/multi&query={quote(key)}&page=1&language=zh-CN"
-        )
-        for item in (data.get("results") or []):
-            if item.get("media_type") in ("movie", "tv"):
-                videos.append(self.item_to_vod(item, "tmdb"))
-        seen = set()
-        uniq = []
-        for v in videos:
-            name = v.get("vod_name") or ""
-            if name in seen:
-                continue
-            seen.add(name)
-            uniq.append(v)
-        return json.dumps({"list": uniq}, ensure_ascii=False)
+    def searchContent(self, key, quick, pg=1):
+        try:
+            videos = []
+            for item in self.collect_search(key):
+                videos.append(self.item_to_vod(item, "collect"))
+            data = self.fetch_json(
+                f"{self.site_url}/api/tmdb.php?path=/search/multi"
+                f"&query={quote(str(key))}&page=1&language=zh-CN"
+            )
+            for item in (data.get("results") or []):
+                if item.get("media_type") in ("movie", "tv"):
+                    videos.append(self.item_to_vod(item, "tmdb"))
+            seen = set()
+            uniq = []
+            for v in videos:
+                name = v.get("vod_name") or ""
+                if name in seen:
+                    continue
+                seen.add(name)
+                uniq.append(v)
+            return self.ok_json({"list": uniq})
+        except Exception as e:
+            print(f"[searchContent] {e}")
+            return self.ok_json({"list": []})
 
     def play_headers_for(self, url):
-        """按片源域名返回播放所需请求头（腾讯/B站等 4K 链强依赖 Referer）"""
         low = (url or "").lower()
         ua = self.headers["User-Agent"]
         h = {
@@ -723,30 +743,21 @@ class Spider:
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        # 腾讯视频 CDN / 页面
-        if any(x in low for x in [
-            "qq.com", "gtimg.com", "v.qq.com", "video.qq.com",
-            "tc.qq.com", "apdcdn", "apd-vlive", "vinfo.ssport.qq.com"
-        ]):
+        if any(x in low for x in ["qq.com", "gtimg.com", "tc.qq.com", "apdcdn", "apd-vlive"]):
             h["Referer"] = "https://v.qq.com/"
             h["Origin"] = "https://v.qq.com"
-        # 哔哩哔哩
         elif any(x in low for x in ["bilibili.com", "bilivideo.", "b23.tv", "hdslb.com"]):
             h["Referer"] = "https://www.bilibili.com/"
             h["Origin"] = "https://www.bilibili.com"
-        # 爱奇艺
-        elif any(x in low for x in ["iqiyi.com", "iqiyipic.com", "qy.net", "video.http.iqiyi"]):
+        elif any(x in low for x in ["iqiyi.com", "iqiyipic.com", "qy.net"]):
             h["Referer"] = "https://www.iqiyi.com/"
             h["Origin"] = "https://www.iqiyi.com"
-        # 优酷
-        elif any(x in low for x in ["youku.com", "ykimg.com", "youkutv.com"]):
+        elif any(x in low for x in ["youku.com", "ykimg.com"]):
             h["Referer"] = "https://www.youku.com/"
             h["Origin"] = "https://www.youku.com"
-        # 芒果
         elif any(x in low for x in ["mgtv.com", "hitv.com"]):
             h["Referer"] = "https://www.mgtv.com/"
             h["Origin"] = "https://www.mgtv.com"
-        # 自营 / 解析站
         elif any(x in low for x in ["jimaoys", "mujizy", "qlplayer", "txnp.cn", "im1907"]):
             h["Referer"] = self.site_url + "/"
             h["Origin"] = self.site_url
@@ -755,34 +766,48 @@ class Spider:
         return h
 
     def playerContent(self, flag, id, vipFlags):
-        play_url = id or ""
-        if not play_url.startswith("http"):
-            play_url = urljoin(self.site_url, play_url)
+        try:
+            play_url = id or ""
+            if not play_url.startswith("http"):
+                play_url = urljoin(self.site_url, play_url)
+            low = play_url.lower()
 
-        low = play_url.lower()
-        is_parse_api = any(x in low for x in [
-            "qlplayer", "txnp.cn", "im1907", "json-player.php",
-            "jx=", "parse?url=", "m3u8/?url="
-        ])
-        is_direct = self.is_direct_video(play_url) and not self.is_official_page(play_url)
+            # 站内 4K 页无法在 App 授权，改公共解析
+            if "json-player.php" in low:
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    qs = parse_qs(urlparse(play_url).query)
+                    raw = (qs.get("url") or [""])[0]
+                    if raw:
+                        self.load_parse_routes()
+                        route = self.parse_routes[0] if self.parse_routes else {
+                            "api": "https://svip.qlplayer.cyou/?url="
+                        }
+                        play_url = self.build_parse_url(route, raw)
+                except Exception:
+                    pass
 
-        # 直链（含解析后得到的 m3u8）直接播；解析页/官网页交给嗅探
-        need_parse = 0 if is_direct else 1
-
-        headers = self.play_headers_for(play_url)
-
-        result = {
-            "parse": need_parse,
-            "playUrl": "",
-            "url": play_url,
-            "header": json.dumps(headers),
-        }
-        # 部分客户端读 headers 字段
-        result["headers"] = result["header"]
-        return json.dumps(result, ensure_ascii=False)
+            is_direct = self.is_direct_video(play_url) and not self.is_official_page(play_url)
+            headers = self.play_headers_for(play_url)
+            header_str = json.dumps(headers, ensure_ascii=False)
+            return self.ok_json({
+                "parse": 0 if is_direct else 1,
+                "jx": "0",
+                "playUrl": "",
+                "url": play_url,
+                "header": header_str,
+                "headers": header_str,
+            })
+        except Exception as e:
+            print(f"[playerContent] {e}")
+            return self.ok_json({
+                "parse": 1,
+                "url": id or "",
+                "header": json.dumps(self.headers, ensure_ascii=False),
+            })
 
     def localProxy(self, param):
-        return json.dumps({"code": 404}, ensure_ascii=False)
+        return self.ok_json({"code": 404})
 
     def isVideoFormat(self, url):
         return any(fmt in (url or "").lower() for fmt in [".m3u8", ".mp4", ".flv", ".ts"])
