@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# IDNFLIX Spider v8.2 - 蜂蜜影视
+# IDNFLIX Spider v8.3 - 蜂蜜影视
 # 自动过 wssplash 门禁（GET + wsidchk），播放优先 vidlink.pro 嗅探
 # extend 可选代理: {"proxy":"http://127.0.0.1:7890"}
 import re
@@ -161,7 +161,36 @@ class Spider(BaseSpider):
             self.log("form_id %s" % e)
             return ""
 
+    def _resolve_imdb(self, title):
+        """用 TVmaze 免费接口把标题解析成 imdb id"""
+        if not title:
+            return ""
+        try:
+            # 去掉中文括号副标题噪音
+            q = re.sub(r"[（(][^）)]*[）)]", " ", title)
+            q = re.sub(r"\s+", " ", q).strip()
+            r = self._req(
+                "GET",
+                "https://api.tvmaze.com/search/shows?q=%s" % quote(q[:80]),
+                headers={"User-Agent": self.ua, "Accept": "application/json"},
+            )
+            if not r or r.status_code != 200:
+                return ""
+            arr = r.json()
+            if not isinstance(arr, list):
+                return ""
+            for item in arr[:8]:
+                show = item.get("show") or {}
+                ext = show.get("externals") or {}
+                imdb = ext.get("imdb") or ""
+                if imdb and str(imdb).startswith("tt"):
+                    return str(imdb)
+        except Exception as e:
+            self.log("tvmaze %s" % e)
+        return ""
+
     def _pass_gate(self, html):
+
         """过 One moment 门禁：GET action?wsidchk&pdata&id&ts&cttl → 写 wssplashchk cookie"""
         try:
             scripts = re.findall(r"<script>([\s\S]*?)</script>", html)
@@ -363,7 +392,13 @@ class Spider(BaseSpider):
             if not raw:
                 return {"list": []}
 
-            lines = self._build_play_lines(raw)
+            imdb = ""
+            m = re.search(r"(tt\d{5,})", html)
+            if m:
+                imdb = m.group(1)
+            if not imdb:
+                imdb = self._resolve_imdb(title)
+            lines = self._build_play_lines(raw, imdb=imdb, title=title)
             if not lines:
                 return {"list": []}
 
@@ -381,8 +416,8 @@ class Spider(BaseSpider):
             return {"list": []}
 
 
-    def _build_play_lines(self, raw):
-        """多格式 embed → Vidlink 优先；Rumble/YT/DM 独立线路；连载补全集数。"""
+    def _build_play_lines(self, raw, imdb="", title=""):
+        """多格式 embed → Vidlink 优先；Rumble/YT/DM 独立线路；动画补 Videasy(imdb)。"""
         tv_path_re = re.compile(r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I)
         tv_id_re = re.compile(r"(?:/v\d+)?/embed/tv/(\d+)(?:\D|$)", re.I)
         movie_re = re.compile(r"(?:/embed)?/movie/([^/?&#]+)", re.I)
@@ -538,7 +573,40 @@ class Spider(BaseSpider):
                 vidlink_eps = full_vl
                 videasy_eps = full_ve
 
+        # 动画等只有 Rumble/YT 时：用 imdb 生成 Videasy / Vidsrc 分集（通常比 Rumble 更清晰）
+        if imdb and (rumble_eps or youtube_eps or dailymotion_eps) and not vidlink_eps:
+            ep_nums = []
+            for lab, _ in [(x.split("$")[0], x.split("$")[-1]) for x in rumble_eps + dailymotion_eps]:
+                mm = ep_num_re.search(lab)
+                if mm:
+                    ep_nums.append(int(mm.group(1)))
+            if not ep_nums:
+                ep_nums = list(range(1, 25))
+            hi = max(ep_nums)
+            # 覆盖 1..max（Rumble 有的集）
+            vasy, vsrc = [], []
+            for ep in range(1, hi + 1):
+                lab = "Ep.%s" % ep
+                vasy.append("%s$https://player.videasy.net/tv/%s/1/%s" % (lab, imdb, ep))
+                vsrc.append("%s$https://vidsrc.me/embed/tv?imdb=%s&season=1&episode=%s" % (lab, imdb, ep))
+            videasy_eps = vasy
+            # vidsrc 备用
+            if not vidsrc_eps:
+                vidsrc_eps = vsrc
+
+        # Rumble 集数名排序（数字升序）
+        def _ep_key(item):
+            lab = item.split("$")[0]
+            mm = ep_num_re.search(lab)
+            return int(mm.group(1)) if mm else 0
+
+        if rumble_eps:
+            rumble_eps = sorted(rumble_eps, key=_ep_key)
+        if videasy_eps and imdb:
+            videasy_eps = sorted(videasy_eps, key=_ep_key)
+
         lines = []
+        # 清晰度优先：Videasy / Vidlink 在前，Rumble 在后
         if vidlink_eps:
             lines.append(("Vidlink", "#".join(vidlink_eps)))
         if videasy_eps:
