@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# IDNFLIX Spider v8.0 - 蜂蜜影视
+# IDNFLIX Spider v8.1 - 蜂蜜影视
 # 自动过 wssplash 门禁（GET + wsidchk），播放优先 vidlink.pro 嗅探
 # extend 可选代理: {"proxy":"http://127.0.0.1:7890"}
 import re
@@ -374,60 +374,102 @@ class Spider(BaseSpider):
             return {"list": []}
 
     def _build_play_lines(self, raw):
-        tv_re = re.compile(r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I)
+        """解析多种 embed，统一生成 Vidlink（可嗅探）为主线路。"""
+        # /tv/{id}/{s}/{e} 或 /embed/tv/{id}/{s}/{e}
+        tv_path_re = re.compile(r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I)
+        # /v3/embed/tv/{id} 或 /embed/tv/{id}（无集数）
+        tv_id_re = re.compile(r"(?:/v\d+)?/embed/tv/(\d+)(?:\D|$)", re.I)
         movie_re = re.compile(r"(?:/embed)?/movie/([^/?&#]+)", re.I)
         imdb_re = re.compile(r"(tt\d{5,})", re.I)
+        # ?tmdb=281016&season=1&episode=10
+        q_tmdb_re = re.compile(r"[?&]tmdb=(\d+)", re.I)
+        q_season_re = re.compile(r"[?&]season=(\d+)", re.I)
+        q_episode_re = re.compile(r"[?&]episode=(\d+)", re.I)
+        # 标签里 S01E10
+        se_label_re = re.compile(r"S(\d+)E(\d+)", re.I)
+
         vidlink_eps, videasy_eps, vidsrc_eps = [], [], []
+
+        def add_tv(label, tid, s, e, keep_href=None):
+            vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
+            videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
+            if keep_href:
+                vidsrc_eps.append("%s$%s" % (label, keep_href))
+            else:
+                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e))
+
+        def add_movie(label, mid, keep_href=None):
+            vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
+            videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
+            if keep_href:
+                vidsrc_eps.append("%s$%s" % (label, keep_href))
+            elif str(mid).startswith("tt"):
+                vidsrc_eps.append("%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, mid))
+            else:
+                vidsrc_eps.append("%s$https://vidsrc.sh/embed/movie/%s" % (label, mid))
 
         for label, href in raw:
             href = (href or "").replace("&amp;", "&").strip()
             low = href.lower()
+            # 从标题取季集
+            ls, le = "1", "1"
+            mlab = se_label_re.search(label)
+            if mlab:
+                ls, le = str(int(mlab.group(1))), str(int(mlab.group(2)))
 
-            if "vidlink.pro" in low:
-                m = tv_re.search(href)
-                if m:
-                    tid, s, e = m.group(1), m.group(2), m.group(3)
-                    vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
-                    videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
-                    continue
-                m = movie_re.search(href)
-                if m:
-                    mid = m.group(1)
-                    vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
-                    videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
-                    continue
-
-            m = tv_re.search(href)
+            # 1) 路径型 tv/id/s/e
+            m = tv_path_re.search(href)
             if m:
-                tid, s, e = m.group(1), m.group(2), m.group(3)
-                vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
-                videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
-                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e))
+                add_tv(label, m.group(1), m.group(2), m.group(3), href)
                 continue
 
+            # 2) 查询参数 tmdb + season + episode（vsembed.ru 等）
+            mq = q_tmdb_re.search(href)
+            if mq:
+                tid = mq.group(1)
+                s = (q_season_re.search(href) or [None, ls])[1] if q_season_re.search(href) else ls
+                e = (q_episode_re.search(href) or [None, le])[1] if q_episode_re.search(href) else le
+                if q_season_re.search(href):
+                    s = q_season_re.search(href).group(1)
+                if q_episode_re.search(href):
+                    e = q_episode_re.search(href).group(1)
+                # 电影还是剧集
+                if "/movie" in low and "/tv" not in low:
+                    add_movie(label, tid, href)
+                else:
+                    add_tv(label, tid, s, e, href)
+                continue
+
+            # 3) /embed/tv/{id} 无集数（vidsrc.cc/v3/...）
+            m = tv_id_re.search(href)
+            if m:
+                add_tv(label, m.group(1), ls, le, href)
+                continue
+
+            # 4) movie 路径
             m = movie_re.search(href)
             if m:
-                mid = m.group(1)
-                vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
-                videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
-                if mid.startswith("tt"):
-                    vidsrc_eps.append("%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, mid))
-                else:
-                    vidsrc_eps.append("%s$https://vidsrc.sh/embed/movie/%s" % (label, mid))
+                add_movie(label, m.group(1), href)
                 continue
 
+            # 5) imdb
             m = imdb_re.search(href)
             if m:
-                imdb = m.group(1)
-                vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, imdb))
-                videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, imdb))
-                vidsrc_eps.append("%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, imdb))
+                add_movie(label, m.group(1), href)
                 continue
 
+            # 6) 已是 vidlink / videasy
             if "vidlink" in low or "videasy" in low:
                 vidlink_eps.append("%s$%s" % (label, href))
-            else:
-                vidsrc_eps.append("%s$%s" % (label, href))
+                continue
+
+            # 未知：仍尝试从 URL 抠数字 id
+            m = re.search(r"(?:tmdb[=/]|[?&]id=)(\d{3,})", href, re.I)
+            if m:
+                add_tv(label, m.group(1), ls, le, href)
+                continue
+
+            vidsrc_eps.append("%s$%s" % (label, href))
 
         lines = []
         if vidlink_eps:
