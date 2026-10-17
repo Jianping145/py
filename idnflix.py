@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-# IDNFLIX Spider v7.6 - 蜂蜜影视
-# 站点播放源以 vidsrc 系 embed 为主；解析 vs_src 拿到内层播放页，并扩展多镜像线路
+# IDNFLIX Spider v7.8 - 蜂蜜影视
+# 播放优先改写为 vidlink.pro（蜂蜜嗅探可播）
 import re
-import time
 import json
-import datetime
 import requests
 import urllib3
-from urllib.parse import urlparse, urljoin, quote, unquote, parse_qs
+from urllib.parse import urlparse, urljoin, quote, unquote
 from bs4 import BeautifulSoup
 
 try:
@@ -30,13 +28,12 @@ class Spider(BaseSpider):
             "User-Agent": self.ua,
             "Referer": self.site + "/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
         }
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        self._cache = {}
+        ad = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+        self.session.mount("http://", ad)
+        self.session.mount("https://", ad)
 
     def getName(self):
         return "IDNFLIX"
@@ -45,7 +42,7 @@ class Spider(BaseSpider):
         if not url:
             return False
         low = url.lower()
-        return any(e in low for e in (".m3u8", ".mp4", ".mkv", ".ts", ".mpd"))
+        return any(x in low for x in (".m3u8", ".mp4", ".mkv", ".ts", ".mpd"))
 
     def manualVideoCheck(self):
         return True
@@ -82,18 +79,15 @@ class Spider(BaseSpider):
             return href
 
     def _get(self, url, headers=None, timeout=15):
-        headers = headers or self.site_headers
         try:
-            r = self.session.get(
-                url, headers=headers, timeout=timeout,
-                allow_redirects=True, verify=False,
+            return self.session.get(
+                url, headers=headers or self.site_headers,
+                timeout=timeout, allow_redirects=True, verify=False,
             )
-            return r
         except Exception as e:
-            self.log("GET err %s %s" % (url[:80], e))
+            self.log("GET %s" % e)
             return None
 
-    # ---------- home / list ----------
     def homeContent(self, filter):
         classes = [
             {"type_name": "Film", "type_id": "kategori/film"},
@@ -105,8 +99,6 @@ class Spider(BaseSpider):
             {"type_name": "Drama", "type_id": "jenis/drama"},
             {"type_name": "Horror", "type_id": "jenis/horror"},
             {"type_name": "Romance", "type_id": "jenis/romance"},
-            {"type_name": "Sci-Fi", "type_id": "jenis/sci-fi"},
-            {"type_name": "Thriller", "type_id": "jenis/thriller"},
             {"type_name": "Korea", "type_id": "negara/korea-selatan"},
             {"type_name": "Japan", "type_id": "negara/jepang"},
             {"type_name": "USA", "type_id": "negara/usa"},
@@ -117,52 +109,40 @@ class Spider(BaseSpider):
         return {"class": classes, "filters": {}}
 
     def homeVideoContent(self):
-        try:
-            r = self._get(self.site + "/")
-            if not r:
-                return {"list": []}
-            soup = BeautifulSoup(r.text, "html.parser")
-            return {"list": self._parse_items(soup, 40)}
-        except Exception as e:
-            self.log("homeVideo %s" % e)
+        r = self._get(self.site + "/")
+        if not r:
             return {"list": []}
+        return {"list": self._parse_items(BeautifulSoup(r.text, "html.parser"), 40)}
 
     def categoryContent(self, tid, pg, filter, extend):
-        try:
-            base = "%s/%s" % (self.site, tid)
-            if str(pg) != "1":
-                base += "?page=%s" % pg
-            r = self._get(base)
-            if not r:
-                return {"list": [], "page": 1, "pagecount": 1, "limit": 40, "total": 0}
-            soup = BeautifulSoup(r.text, "html.parser")
-            items = self._parse_items(soup, 40)
-            return {
-                "list": items,
-                "page": int(pg),
-                "pagecount": int(pg) + 1,
-                "limit": 40,
-                "total": 999999,
-            }
-        except Exception as e:
-            self.log("category %s" % e)
+        base = "%s/%s" % (self.site, tid)
+        if str(pg) != "1":
+            base += "?page=%s" % pg
+        r = self._get(base)
+        if not r:
             return {"list": [], "page": 1, "pagecount": 1, "limit": 40, "total": 0}
+        items = self._parse_items(BeautifulSoup(r.text, "html.parser"), 40)
+        return {
+            "list": items, "page": int(pg), "pagecount": int(pg) + 1,
+            "limit": 40, "total": 999999,
+        }
+
+    def searchContent(self, key, quick, pg="1"):
+        r = self._get("%s/?search=%s" % (self.site, quote(key)))
+        if not r:
+            return {"list": []}
+        return {"list": self._parse_items(BeautifulSoup(r.text, "html.parser"), 40)}
 
     def _parse_items(self, soup, limit=40):
         items, seen = [], set()
-        covers = soup.select("a.item__cover[href]")
-        if not covers:
-            covers = soup.select('a[href*="/movie/"]')
+        covers = soup.select("a.item__cover[href]") or soup.select('a[href*="/movie/"]')
         for cover in covers:
             if len(items) >= limit:
                 break
             href = (cover.get("href") or "").strip()
-            if not href or href in seen:
-                continue
-            if "/movie/" not in href:
+            if not href or href in seen or "/movie/" not in href:
                 continue
             seen.add(href)
-            vid = self._make_id(href)
             img = cover.find("img")
             pic = self._abs(img.get("src", "")) if img else ""
             title = (img.get("alt", "") if img else "").strip()
@@ -173,25 +153,13 @@ class Spider(BaseSpider):
                     title = h3.get_text(strip=True) or title
             if title:
                 items.append({
-                    "vod_id": vid,
+                    "vod_id": self._make_id(href),
                     "vod_name": title,
                     "vod_pic": pic,
                     "vod_remarks": "",
                 })
         return items
 
-    def searchContent(self, key, quick, pg="1"):
-        try:
-            url = "%s/?search=%s" % (self.site, quote(key))
-            r = self._get(url)
-            if not r:
-                return {"list": []}
-            soup = BeautifulSoup(r.text, "html.parser")
-            return {"list": self._parse_items(soup, 40), "page": 1, "pagecount": 1}
-        except Exception:
-            return {"list": []}
-
-    # ---------- detail ----------
     def detailContent(self, ids):
         try:
             path = ids[0] if isinstance(ids, (list, tuple)) else str(ids)
@@ -222,67 +190,23 @@ class Spider(BaseSpider):
             if de:
                 desc = de.get_text(strip=True)[:1500]
 
-            # 原始播放链接
-            raw_players = []
+            raw = []
             for a in soup.select("ul.episode li.list-item a[href]"):
-                href = (a.get("href") or "").strip()
+                href = (a.get("href") or "").strip().replace("&amp;", "&")
                 if not href:
                     continue
-                label = a.get_text(" ", strip=True)
-                label = re.sub(r"\s+", " ", label).replace("PLAY", "").strip()[:50] or "Play"
-                raw_players.append((label, href))
+                label = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+                label = label.replace("PLAY", "").strip()[:60] or "Play"
+                m = re.search(r"(S\d+E\d+)", label, re.I)
+                if m:
+                    label = m.group(1).upper()
+                raw.append((label, href))
 
-            if not raw_players:
-                for href in re.findall(
-                    r'https?://(?:vidsrc|vidlink|videasy|vidrock|rumble|embed)[^"\s\'<>]+',
-                    html, re.I,
-                ):
-                    raw_players.append(("Play", href.replace("&amp;", "&")))
-
-            if not raw_players:
+            if not raw:
                 return {"list": []}
 
-            # 提取 imdb / tmdb，扩展多线路镜像
-            imdb = ""
-            m = re.search(r"(tt\d{5,})", html)
-            if m:
-                imdb = m.group(1)
-            for _, href in raw_players:
-                m = re.search(r"(tt\d{5,})", href)
-                if m:
-                    imdb = m.group(1)
-                    break
-            tmdb = ""
-            m = re.search(r"vidsrc[^\"']*/(?:movie|tv)/(\d+)", html)
-            if m:
-                tmdb = m.group(1)
-
-            expanded = self._expand_servers(raw_players, imdb, tmdb)
-
-            # 按服务商分组
-            servers = {}
-            for label, purl in expanded:
-                srv = self._classify_server(purl)
-                servers.setdefault(srv, []).append((label, purl))
-
-            priority = [
-                "Vidsrc2", "Vidsrc.sh", "Vidsrc.me", "Vidsrc", "Vidsrc.to",
-                "Videasy", "Vidlink", "Rumble", "2Embed", "Other",
-            ]
-            from_list, url_list = [], []
-            for srv in priority:
-                if srv not in servers:
-                    continue
-                eps = servers[srv]
-                from_list.append(srv)
-                url_list.append("#".join("%s$%s" % (l, u) for l, u in eps))
-            for srv, eps in servers.items():
-                if srv in from_list:
-                    continue
-                from_list.append(srv)
-                url_list.append("#".join("%s$%s" % (l, u) for l, u in eps))
-
-            if not from_list:
+            lines = self._build_play_lines(raw)
+            if not lines:
                 return {"list": []}
 
             return {"list": [{
@@ -291,65 +215,77 @@ class Spider(BaseSpider):
                 "vod_pic": pic,
                 "vod_year": year,
                 "vod_content": desc,
-                "vod_play_from": "$$$".join(from_list),
-                "vod_play_url": "$$$".join(url_list),
+                "vod_play_from": "$$$".join([x[0] for x in lines]),
+                "vod_play_url": "$$$".join([x[1] for x in lines]),
             }]}
         except Exception as e:
             self.log("detail %s" % e)
             return {"list": []}
 
-    def _expand_servers(self, raw_players, imdb, tmdb):
-        """把单一 embed 扩成多镜像，提高可播概率"""
-        out = []
-        seen = set()
+    def _build_play_lines(self, raw):
+        """把分集改写成 vidlink.pro（蜂蜜可嗅探播放）+ 少量备用。"""
+        # embed/tv/{id}/{s}/{e} 或 embed/movie/{id}
+        tv_re = re.compile(
+            r"/embed/tv/([^/]+)/(\d+)/(\d+)", re.I
+        )
+        movie_re = re.compile(
+            r"/embed/movie/([^/?&#]+)", re.I
+        )
+        imdb_re = re.compile(r"(tt\d{5,})", re.I)
 
-        def add(label, url):
-            if not url or url in seen:
-                return
-            seen.add(url)
-            out.append((label, url))
+        vidlink_eps = []
+        videasy_eps = []
+        vidsrc_eps = []
 
-        for label, href in raw_players:
-            add(label, href.replace("&amp;", "&"))
+        for label, href in raw:
+            href = href.replace("&amp;", "&")
+            m = tv_re.search(href)
+            if m:
+                tid, season, episode = m.group(1), m.group(2), m.group(3)
+                vidlink_eps.append(
+                    "%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, season, episode)
+                )
+                videasy_eps.append(
+                    "%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, season, episode)
+                )
+                vidsrc_eps.append(
+                    "%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, season, episode)
+                )
+                continue
 
-        mid = tmdb or imdb
-        if imdb:
-            add("Vidsrc2", "https://vidsrc2.ru/embed/movie?imdb=%s" % imdb)
-            add("Vidsrc.sh", "https://vidsrc.sh/embed/movie/%s" % imdb)
-            add("Vidsrc.me", "https://vidsrc.me/embed/movie/%s" % imdb)
-            add("Vidsrc.to", "https://vidsrc.to/embed/movie/%s" % imdb)
-            add("2Embed", "https://www.2embed.cc/embed/%s" % imdb)
-        if tmdb:
-            add("Vidsrc.sh/T", "https://vidsrc.sh/embed/movie/%s" % tmdb)
-            add("Videasy", "https://player.videasy.net/movie/%s" % tmdb)
-            add("Vidlink", "https://vidlink.pro/movie/%s" % tmdb)
-        return out
+            m = movie_re.search(href)
+            if m:
+                mid = m.group(1)
+                vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
+                videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
+                vidsrc_eps.append("%s$https://vidsrc.sh/embed/movie/%s" % (label, mid))
+                continue
 
-    def _classify_server(self, url):
-        if not url:
-            return "Other"
-        low = url.lower()
-        if "vidsrc2" in low:
-            return "Vidsrc2"
-        if "vidsrc.sh" in low:
-            return "Vidsrc.sh"
-        if "vidsrc.me" in low:
-            return "Vidsrc.me"
-        if "vidsrc.to" in low:
-            return "Vidsrc.to"
-        if "vidsrc." in low:
-            return "Vidsrc"
-        if "videasy" in low:
-            return "Videasy"
-        if "vidlink" in low:
-            return "Vidlink"
-        if "rumble" in low:
-            return "Rumble"
-        if "2embed" in low:
-            return "2Embed"
-        return "Other"
+            m = imdb_re.search(href)
+            if m:
+                imdb = m.group(1)
+                # 电影 imdb
+                if "/tv" not in href.lower():
+                    vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, imdb))
+                    vidsrc_eps.append(
+                        "%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, imdb)
+                    )
+                else:
+                    vidsrc_eps.append("%s$%s" % (label, href))
+                continue
 
-    # ---------- player ----------
+            # 原样保留
+            vidsrc_eps.append("%s$%s" % (label, href))
+
+        lines = []
+        if vidlink_eps:
+            lines.append(("Vidlink", "#".join(vidlink_eps)))
+        if videasy_eps:
+            lines.append(("Videasy", "#".join(videasy_eps)))
+        if vidsrc_eps:
+            lines.append(("Vidsrc", "#".join(vidsrc_eps)))
+        return lines
+
     def playerContent(self, flag, id, vipFlags):
         try:
             url = unquote(str(id)).strip()
@@ -361,271 +297,67 @@ class Spider(BaseSpider):
                     "parse": 0,
                     "jx": 0,
                     "url": url,
-                    "header": self._play_headers(flag, url),
+                    "header": {
+                        "User-Agent": self.ua,
+                        "Referer": "https://vidlink.pro/",
+                    },
                 }
 
             low = url.lower()
-
-            # Rumble
-            if "rumble.com" in low:
-                direct = self._extract_rumble(url)
-                if direct:
-                    return {
-                        "parse": 0, "jx": 0, "url": direct,
-                        "header": {
-                            "User-Agent": self.ua,
-                            "Referer": "https://rumble.com/",
-                            "Origin": "https://rumble.com",
-                        },
-                    }
-
-            # Vidlink
-            if "vidlink" in low:
-                direct = self._extract_vidlink(url)
-                if direct:
-                    return {
-                        "parse": 0, "jx": 0, "url": direct,
-                        "header": {
-                            "User-Agent": self.ua,
-                            "Referer": "https://vidlink.pro/",
-                            "Origin": "https://vidlink.pro",
-                        },
-                    }
-
-            # vidsrc 系：解析 vs_src 拿到内层播放器，交给壳嗅探
-            if any(x in low for x in ("vidsrc", "vsembed", "stellarconductor")):
-                resolved = self._resolve_vidsrc(url)
-                if resolved:
-                    if self.isVideoFormat(resolved):
-                        return {
-                            "parse": 0, "jx": 0, "url": resolved,
-                            "header": self._play_headers(flag, resolved),
-                        }
-                    return {
-                        "parse": 1, "jx": 0, "url": resolved,
-                        "header": self._play_headers(flag, resolved),
-                    }
-
-            # 2embed 等：直接嗅探
-            if "2embed" in low:
+            # vidlink / videasy：蜂蜜嗅探可播
+            if "vidlink.pro" in low:
                 return {
-                    "parse": 1, "jx": 0, "url": url,
-                    "header": {"User-Agent": self.ua, "Referer": "https://www.2embed.cc/"},
+                    "parse": 1,
+                    "jx": 0,
+                    "url": url,
+                    "header": {
+                        "User-Agent": self.ua,
+                        "Referer": "https://vidlink.pro/",
+                        "Origin": "https://vidlink.pro",
+                    },
+                }
+            if "videasy" in low:
+                return {
+                    "parse": 1,
+                    "jx": 0,
+                    "url": url,
+                    "header": {
+                        "User-Agent": self.ua,
+                        "Referer": "https://player.videasy.net/",
+                    },
                 }
 
-            # 默认：壳内嗅探播放
+            # 其它 embed 也走嗅探
             return {
                 "parse": 1,
                 "jx": 0,
                 "url": url,
-                "header": self._play_headers(flag, url),
+                "header": {
+                    "User-Agent": self.ua,
+                    "Referer": self.site + "/",
+                },
             }
         except Exception as e:
             self.log("player %s" % e)
             return {
                 "parse": 1,
-                "url": self._abs(str(id)),
+                "url": str(id),
                 "header": {"User-Agent": self.ua},
             }
-
-    def _play_headers(self, flag, url=""):
-        low = (url or "").lower()
-        if "vidsrc" in low or "stellar" in low:
-            return {
-                "User-Agent": self.ua,
-                "Referer": "https://vidsrc.sh/",
-                "Origin": "https://vidsrc.sh",
-            }
-        if "videasy" in low:
-            return {
-                "User-Agent": self.ua,
-                "Referer": "https://player.videasy.net/",
-            }
-        return {
-            "User-Agent": self.ua,
-            "Referer": self.site + "/",
-        }
-
-    def _resolve_vidsrc(self, embed_url):
-        """vidsrc embed -> vs_src.php -> 内层 player 页"""
-        if embed_url in self._cache:
-            return self._cache[embed_url]
-        try:
-            # 已是内层
-            if "stellarconductornexus.com" in embed_url or "/embed/player/" in embed_url:
-                return embed_url
-
-            r = self._get(embed_url, headers={
-                "User-Agent": self.ua,
-                "Referer": self.site + "/",
-            }, timeout=12)
-            if not r or r.status_code != 200:
-                return None
-
-            html = r.text
-            # data-api="/vs_src.php?type=movie&id=xxx"
-            m = re.search(r'data-api="([^"]+)"', html)
-            api = ""
-            if m:
-                api = m.group(1).replace("&amp;", "&")
-                if api.startswith("/"):
-                    api = "%s://%s%s" % (urlparse(r.url).scheme, urlparse(r.url).netloc, api)
-            else:
-                # 从 URL 推断
-                mid = ""
-                m2 = re.search(r"/embed/(?:movie|tv)/([^/?&#]+)", embed_url)
-                if m2:
-                    mid = m2.group(1)
-                else:
-                    qs = parse_qs(urlparse(embed_url).query)
-                    mid = (qs.get("imdb") or qs.get("tmdb") or qs.get("id") or [""])[0]
-                if not mid:
-                    return None
-                host = "%s://%s" % (urlparse(embed_url).scheme, urlparse(embed_url).netloc)
-                # tv?
-                typ = "tv" if "/tv" in embed_url or "type=tv" in embed_url else "movie"
-                api = "%s/vs_src.php?type=%s&id=%s" % (host, typ, mid)
-
-            self.log("vs_src %s" % api)
-            rj = self._get(api, headers={
-                "User-Agent": self.ua,
-                "Referer": embed_url,
-                "Accept": "application/json",
-            }, timeout=10)
-            if not rj or rj.status_code != 200:
-                return None
-            try:
-                data = rj.json()
-            except Exception:
-                return None
-            src = data.get("src") or data.get("url") or ""
-            if not src:
-                return None
-
-            # 再进一层拿 playerUrl（更接近真实播放器，嗅探成功率更高）
-            r2 = self._get(src, headers={
-                "User-Agent": self.ua,
-                "Referer": embed_url,
-            }, timeout=12)
-            if r2 and r2.status_code == 200:
-                m = re.search(r'window\.CFG\s*=\s*(\{.*?\})\s*;', r2.text)
-                if m:
-                    try:
-                        cfg = json.loads(m.group(1))
-                        p = cfg.get("playerUrl") or ""
-                        if p:
-                            if p.startswith("/"):
-                                p = "%s://%s%s" % (
-                                    urlparse(src).scheme, urlparse(src).netloc, p
-                                )
-                            self._cache[embed_url] = p
-                            return p
-                    except Exception:
-                        pass
-            self._cache[embed_url] = src
-            return src
-        except Exception as e:
-            self.log("resolve_vidsrc %s" % e)
-            return None
-
-    def _extract_rumble(self, rumble_url):
-        try:
-            m = re.search(r"/embed/([a-zA-Z0-9]+)", rumble_url)
-            if not m:
-                return None
-            video_id = m.group(1)
-            pub = ""
-            m2 = re.search(r"[?&]pub=([a-zA-Z0-9]+)", rumble_url)
-            if m2:
-                pub = m2.group(1)
-            apis = [
-                "https://rumble.com/api/v1.0/embed/%s?pub=%s" % (video_id, pub),
-                "https://rumble.com/api/v1.0/embed/%s" % video_id,
-                "https://rumble.com/embedJS/u3/?request=video&ver=2&v=%s" % video_id,
-            ]
-            for api in apis:
-                r = self._get(api, headers={
-                    "User-Agent": self.ua,
-                    "Referer": rumble_url,
-                    "Origin": "https://rumble.com",
-                    "Accept": "application/json,*/*",
-                }, timeout=10)
-                if not r or r.status_code != 200:
-                    continue
-                try:
-                    j = r.json()
-                except Exception:
-                    j = None
-                if j:
-                    found = self._find_media_deep(j, ".m3u8") or self._find_media_deep(j, ".mp4")
-                    if found:
-                        return found
-                m3 = re.search(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', r.text)
-                if m3:
-                    return m3.group(1)
-        except Exception as e:
-            self.log("rumble %s" % e)
-        return None
-
-    def _extract_vidlink(self, vidlink_url):
-        try:
-            m = re.search(r"/(movie|tv)/(\d+)", vidlink_url)
-            if not m:
-                return None
-            media_type, tmdb_id = m.group(1), m.group(2)
-            for api in (
-                "https://vidlink.pro/api/b/%s/%s" % (media_type, tmdb_id),
-                "https://vidlink.pro/api/%s/%s" % (media_type, tmdb_id),
-            ):
-                r = self._get(api, headers={
-                    "User-Agent": self.ua,
-                    "Referer": vidlink_url,
-                    "Origin": "https://vidlink.pro",
-                    "Accept": "application/json",
-                }, timeout=10)
-                if not r or r.status_code != 200:
-                    continue
-                try:
-                    j = r.json()
-                    found = self._find_media_deep(j, ".m3u8")
-                    if found:
-                        return found
-                except Exception:
-                    m3 = re.search(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', r.text)
-                    if m3:
-                        return m3.group(1)
-        except Exception as e:
-            self.log("vidlink %s" % e)
-        return None
-
-    def _find_media_deep(self, data, ext):
-        if isinstance(data, str):
-            if ext in data and data.startswith("http"):
-                return data
-        elif isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, str) and ext in v and v.startswith("http"):
-                    return v
-                r = self._find_media_deep(v, ext)
-                if r:
-                    return r
-        elif isinstance(data, list):
-            for item in data:
-                r = self._find_media_deep(item, ext)
-                if r:
-                    return r
-        return None
 
     def localProxy(self, param):
         try:
             url = unquote((param or {}).get("url", ""))
             if not url:
-                return [400, "text/plain", b"missing url"]
+                return [400, "text/plain", b"missing"]
             r = self.session.get(
                 url, headers={"User-Agent": self.ua},
-                timeout=20, verify=False, stream=True,
+                timeout=20, verify=False,
             )
-            ctype = r.headers.get("Content-Type", "application/octet-stream")
-            return [r.status_code, ctype, r.content]
+            return [
+                r.status_code,
+                r.headers.get("Content-Type", "application/octet-stream"),
+                r.content,
+            ]
         except Exception as e:
             return [500, "text/plain", str(e).encode()]
