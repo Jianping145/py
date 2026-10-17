@@ -200,6 +200,8 @@ class Spider(BaseSpider):
                 m = re.search(r"(S\d+E\d+)", label, re.I)
                 if m:
                     label = m.group(1).upper()
+                elif re.search(r"server\s*\d+", label, re.I):
+                    label = "正片"
                 raw.append((label, href))
 
             if not raw:
@@ -223,59 +225,108 @@ class Spider(BaseSpider):
             return {"list": []}
 
     def _build_play_lines(self, raw):
-        """把分集改写成 vidlink.pro（蜂蜜可嗅探播放）+ 少量备用。"""
-        # embed/tv/{id}/{s}/{e} 或 embed/movie/{id}
+        """统一改写成 vidlink.pro（蜂蜜可嗅探），并附带备用线路。"""
+        # 兼容多种路径：
+        # /embed/tv/{id}/{s}/{e}  /tv/{id}/{s}/{e}
+        # /embed/movie/{id}       /movie/{id}
+        # ?imdb=tt... /movie/tt...
         tv_re = re.compile(
-            r"/embed/tv/([^/]+)/(\d+)/(\d+)", re.I
+            r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I
         )
         movie_re = re.compile(
-            r"/embed/movie/([^/?&#]+)", re.I
+            r"(?:/embed)?/movie/([^/?&#]+)", re.I
         )
         imdb_re = re.compile(r"(tt\d{5,})", re.I)
+        tmdb_num_re = re.compile(r"(?:tmdb[=/]|/movie/)(\d{3,})", re.I)
 
         vidlink_eps = []
         videasy_eps = []
         vidsrc_eps = []
 
         for label, href in raw:
-            href = href.replace("&amp;", "&")
+            href = (href or "").replace("&amp;", "&").strip()
+            low = href.lower()
+            done = False
+
+            # 已是 vidlink
+            if "vidlink.pro" in low:
+                m = tv_re.search(href)
+                if m:
+                    tid, s, e = m.group(1), m.group(2), m.group(3)
+                    vidlink_eps.append(
+                        "%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e)
+                    )
+                    videasy_eps.append(
+                        "%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e)
+                    )
+                    done = True
+                else:
+                    m = movie_re.search(href)
+                    if m:
+                        mid = m.group(1)
+                        vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
+                        videasy_eps.append(
+                            "%s$https://player.videasy.net/movie/%s" % (label, mid)
+                        )
+                        done = True
+                if done:
+                    continue
+
+            # 剧集
             m = tv_re.search(href)
             if m:
-                tid, season, episode = m.group(1), m.group(2), m.group(3)
+                tid, s, e = m.group(1), m.group(2), m.group(3)
                 vidlink_eps.append(
-                    "%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, season, episode)
+                    "%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e)
                 )
                 videasy_eps.append(
-                    "%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, season, episode)
+                    "%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e)
                 )
                 vidsrc_eps.append(
-                    "%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, season, episode)
+                    "%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e)
                 )
                 continue
 
+            # 电影路径
             m = movie_re.search(href)
             if m:
                 mid = m.group(1)
                 vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
                 videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
-                vidsrc_eps.append("%s$https://vidsrc.sh/embed/movie/%s" % (label, mid))
+                if mid.startswith("tt"):
+                    vidsrc_eps.append(
+                        "%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, mid)
+                    )
+                else:
+                    vidsrc_eps.append(
+                        "%s$https://vidsrc.sh/embed/movie/%s" % (label, mid)
+                    )
                 continue
 
+            # 仅 imdb
             m = imdb_re.search(href)
             if m:
                 imdb = m.group(1)
-                # 电影 imdb
-                if "/tv" not in href.lower():
-                    vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, imdb))
-                    vidsrc_eps.append(
-                        "%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, imdb)
-                    )
-                else:
-                    vidsrc_eps.append("%s$%s" % (label, href))
+                vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, imdb))
+                videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, imdb))
+                vidsrc_eps.append(
+                    "%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, imdb)
+                )
                 continue
 
-            # 原样保留
-            vidsrc_eps.append("%s$%s" % (label, href))
+            # tmdb 数字
+            m = tmdb_num_re.search(href)
+            if m:
+                mid = m.group(1)
+                vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
+                videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
+                continue
+
+            # 未知：若已是可嗅探域名仍放进 Vidlink 组
+            if any(x in low for x in ("vidlink", "videasy")):
+                vidlink_eps.append("%s$%s" % (label, href))
+            else:
+                vidsrc_eps.append("%s$%s" % (label, href))
 
         lines = []
         if vidlink_eps:
