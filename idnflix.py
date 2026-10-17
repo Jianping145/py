@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# IDNFLIX Spider v8.1 - 蜂蜜影视
+# IDNFLIX Spider v8.2 - 蜂蜜影视
 # 自动过 wssplash 门禁（GET + wsidchk），播放优先 vidlink.pro 嗅探
 # extend 可选代理: {"proxy":"http://127.0.0.1:7890"}
 import re
@@ -345,12 +345,19 @@ class Spider(BaseSpider):
                 if not href:
                     continue
                 label = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
-                label = label.replace("PLAY", "").strip()[:60] or "Play"
+                label = label.replace("PLAY", "").strip()
+                # 规范集名
                 m = re.search(r"(S\d+E\d+)", label, re.I)
                 if m:
                     label = m.group(1).upper()
-                elif re.search(r"server\s*\d+", label, re.I):
-                    label = "正片"
+                else:
+                    m = re.search(r"Ep\.?\s*(\d+(?:\s*[-~]\s*\d+)?)", label, re.I)
+                    if m:
+                        label = "Ep." + m.group(1).replace(" ", "")
+                    elif re.search(r"server\s*\d+", label, re.I):
+                        label = "正片"
+                    else:
+                        label = label[:40] or "Play"
                 raw.append((label, href))
 
             if not raw:
@@ -373,30 +380,29 @@ class Spider(BaseSpider):
             self.log("detail %s" % e)
             return {"list": []}
 
+
     def _build_play_lines(self, raw):
-        """解析多种 embed，统一生成 Vidlink（可嗅探）为主线路。"""
-        # /tv/{id}/{s}/{e} 或 /embed/tv/{id}/{s}/{e}
+        """多格式 embed → Vidlink 优先；Rumble/YT/DM 独立线路；连载补全集数。"""
         tv_path_re = re.compile(r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I)
-        # /v3/embed/tv/{id} 或 /embed/tv/{id}（无集数）
         tv_id_re = re.compile(r"(?:/v\d+)?/embed/tv/(\d+)(?:\D|$)", re.I)
         movie_re = re.compile(r"(?:/embed)?/movie/([^/?&#]+)", re.I)
         imdb_re = re.compile(r"(tt\d{5,})", re.I)
-        # ?tmdb=281016&season=1&episode=10
         q_tmdb_re = re.compile(r"[?&]tmdb=(\d+)", re.I)
         q_season_re = re.compile(r"[?&]season=(\d+)", re.I)
         q_episode_re = re.compile(r"[?&]episode=(\d+)", re.I)
-        # 标签里 S01E10
         se_label_re = re.compile(r"S(\d+)E(\d+)", re.I)
+        ep_num_re = re.compile(r"Ep\.?\s*(\d+)", re.I)
 
         vidlink_eps, videasy_eps, vidsrc_eps = [], [], []
+        rumble_eps, youtube_eps, dailymotion_eps = [], [], []
 
         def add_tv(label, tid, s, e, keep_href=None):
-            vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
-            videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
+            vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, int(s), int(e)))
+            videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, int(s), int(e)))
             if keep_href:
                 vidsrc_eps.append("%s$%s" % (label, keep_href))
             else:
-                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e))
+                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, int(s), int(e)))
 
         def add_movie(label, mid, keep_href=None):
             vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
@@ -408,74 +414,141 @@ class Spider(BaseSpider):
             else:
                 vidsrc_eps.append("%s$https://vidsrc.sh/embed/movie/%s" % (label, mid))
 
+        tmdb_ids_seen = set()
+        max_ep_hint = 1
+        ongoing = False
+
         for label, href in raw:
             href = (href or "").replace("&amp;", "&").strip()
             low = href.lower()
-            # 从标题取季集
+            if "on going" in (label or "").lower() or "ongoing" in low:
+                ongoing = True
+
             ls, le = "1", "1"
-            mlab = se_label_re.search(label)
+            mlab = se_label_re.search(label or "")
             if mlab:
                 ls, le = str(int(mlab.group(1))), str(int(mlab.group(2)))
+                max_ep_hint = max(max_ep_hint, int(le))
+            else:
+                mlab = ep_num_re.search(label or "")
+                if mlab:
+                    le = str(int(mlab.group(1)))
+                    max_ep_hint = max(max_ep_hint, int(le))
 
-            # 1) 路径型 tv/id/s/e
+            # Rumble / YouTube / Dailymotion（动画站常用）
+            if "rumble.com" in low:
+                rumble_eps.append("%s$%s" % (label, href))
+                continue
+            if "youtube.com" in low or "youtu.be" in low:
+                youtube_eps.append("%s$%s" % (label, href))
+                continue
+            if "dailymotion.com" in low:
+                dailymotion_eps.append("%s$%s" % (label, href))
+                continue
+
+            # 路径 tv/id/s/e
             m = tv_path_re.search(href)
             if m:
+                tmdb_ids_seen.add(m.group(1))
                 add_tv(label, m.group(1), m.group(2), m.group(3), href)
                 continue
 
-            # 2) 查询参数 tmdb + season + episode（vsembed.ru 等）
+            # ?tmdb=&season=&episode=
             mq = q_tmdb_re.search(href)
             if mq:
                 tid = mq.group(1)
-                s = (q_season_re.search(href) or [None, ls])[1] if q_season_re.search(href) else ls
-                e = (q_episode_re.search(href) or [None, le])[1] if q_episode_re.search(href) else le
-                if q_season_re.search(href):
-                    s = q_season_re.search(href).group(1)
-                if q_episode_re.search(href):
-                    e = q_episode_re.search(href).group(1)
-                # 电影还是剧集
+                tmdb_ids_seen.add(tid)
+                s = q_season_re.search(href)
+                e = q_episode_re.search(href)
+                s = s.group(1) if s else ls
+                e = e.group(1) if e else le
+                max_ep_hint = max(max_ep_hint, int(e))
                 if "/movie" in low and "/tv" not in low:
                     add_movie(label, tid, href)
                 else:
                     add_tv(label, tid, s, e, href)
                 continue
 
-            # 3) /embed/tv/{id} 无集数（vidsrc.cc/v3/...）
+            # /embed/tv/{id} 无集数
             m = tv_id_re.search(href)
             if m:
-                add_tv(label, m.group(1), ls, le, href)
+                tid = m.group(1)
+                tmdb_ids_seen.add(tid)
+                add_tv(label, tid, ls, le, href)
                 continue
 
-            # 4) movie 路径
             m = movie_re.search(href)
             if m:
                 add_movie(label, m.group(1), href)
                 continue
 
-            # 5) imdb
             m = imdb_re.search(href)
             if m:
                 add_movie(label, m.group(1), href)
                 continue
 
-            # 6) 已是 vidlink / videasy
             if "vidlink" in low or "videasy" in low:
                 vidlink_eps.append("%s$%s" % (label, href))
                 continue
 
-            # 未知：仍尝试从 URL 抠数字 id
             m = re.search(r"(?:tmdb[=/]|[?&]id=)(\d{3,})", href, re.I)
             if m:
+                tmdb_ids_seen.add(m.group(1))
                 add_tv(label, m.group(1), ls, le, href)
                 continue
 
             vidsrc_eps.append("%s$%s" % (label, href))
+
+        # 连载只挂了 1 集时，用 tmdb 按 Vidlink 补全 S01E01..E40（可点集数更多）
+        if tmdb_ids_seen and len(vidlink_eps) <= 2:
+            tid = next(iter(tmdb_ids_seen))
+            # 已有的集数
+            have = set()
+            for x in vidlink_eps:
+                mm = se_label_re.search(x.split("$")[0])
+                if mm:
+                    have.add((int(mm.group(1)), int(mm.group(2))))
+            total = 40 if ongoing or len(vidlink_eps) <= 1 else max(max_ep_hint, 12)
+            total = max(total, max_ep_hint)
+            new_vl, new_ve = [], []
+            for ep in range(1, total + 1):
+                if (1, ep) in have:
+                    # keep existing label order later
+                    continue
+                lab = "S01E%02d" % ep
+                new_vl.append("%s$https://vidlink.pro/tv/%s/1/%s" % (lab, tid, ep))
+                new_ve.append("%s$https://player.videasy.net/tv/%s/1/%s" % (lab, tid, ep))
+            # 合并：已有的放前面，再补全
+            if new_vl:
+                # 重建完整 1..total
+                full_vl, full_ve = [], []
+                existing_map = {}
+                for x in vidlink_eps:
+                    mm = se_label_re.search(x.split("$")[0])
+                    if mm:
+                        existing_map[(int(mm.group(1)), int(mm.group(2)))] = x
+                for ep in range(1, total + 1):
+                    key = (1, ep)
+                    lab = "S01E%02d" % ep
+                    if key in existing_map:
+                        full_vl.append(existing_map[key])
+                    else:
+                        full_vl.append("%s$https://vidlink.pro/tv/%s/1/%s" % (lab, tid, ep))
+                    full_ve.append("%s$https://player.videasy.net/tv/%s/1/%s" % (lab, tid, ep))
+                vidlink_eps = full_vl
+                videasy_eps = full_ve
 
         lines = []
         if vidlink_eps:
             lines.append(("Vidlink", "#".join(vidlink_eps)))
         if videasy_eps:
             lines.append(("Videasy", "#".join(videasy_eps)))
+        if rumble_eps:
+            lines.append(("Rumble", "#".join(rumble_eps)))
+        if dailymotion_eps:
+            lines.append(("Dailymotion", "#".join(dailymotion_eps)))
+        if youtube_eps:
+            lines.append(("YouTube", "#".join(youtube_eps)))
         if vidsrc_eps:
             lines.append(("Vidsrc", "#".join(vidsrc_eps)))
         return lines
@@ -504,6 +577,25 @@ class Spider(BaseSpider):
                 return {
                     "parse": 1, "jx": 0, "url": url,
                     "header": {"User-Agent": self.ua, "Referer": "https://player.videasy.net/"},
+                }
+            if "rumble.com" in low:
+                return {
+                    "parse": 1, "jx": 0, "url": url,
+                    "header": {
+                        "User-Agent": self.ua,
+                        "Referer": "https://rumble.com/",
+                        "Origin": "https://rumble.com",
+                    },
+                }
+            if "youtube.com" in low or "youtu.be" in low:
+                return {
+                    "parse": 1, "jx": 0, "url": url,
+                    "header": {"User-Agent": self.ua, "Referer": "https://www.youtube.com/"},
+                }
+            if "dailymotion.com" in low:
+                return {
+                    "parse": 1, "jx": 0, "url": url,
+                    "header": {"User-Agent": self.ua, "Referer": "https://www.dailymotion.com/"},
                 }
             return {
                 "parse": 1, "jx": 0, "url": url,
