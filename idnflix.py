@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# IDNFLIX Spider v7.8 - 蜂蜜影视
-# 播放优先改写为 vidlink.pro（蜂蜜嗅探可播）
+# IDNFLIX Spider v8.0 - 蜂蜜影视
+# 自动过 wssplash 门禁（GET + wsidchk），播放优先 vidlink.pro 嗅探
+# extend 可选代理: {"proxy":"http://127.0.0.1:7890"}
 import re
 import json
 import requests
 import urllib3
-from urllib.parse import urlparse, urljoin, quote, unquote
+from urllib.parse import urlparse, urljoin, quote, unquote, urlencode
 from bs4 import BeautifulSoup
 
 try:
@@ -26,14 +27,41 @@ class Spider(BaseSpider):
         )
         self.site_headers = {
             "User-Agent": self.ua,
-            "Referer": self.site + "/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Upgrade-Insecure-Requests": "1",
         }
         self.session = requests.Session()
         ad = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
         self.session.mount("http://", ad)
         self.session.mount("https://", ad)
+        self.proxy = None
+        self._gate_ok = False
+        self._apply_extend(extend)
+
+    def _apply_extend(self, extend):
+        if not extend:
+            return
+        obj = extend
+        if isinstance(extend, str):
+            extend = extend.strip()
+            if not extend:
+                return
+            try:
+                obj = json.loads(extend)
+            except Exception:
+                if extend.startswith("http") or extend.startswith("socks"):
+                    obj = {"proxy": extend}
+                else:
+                    return
+        if isinstance(obj, dict):
+            proxy = obj.get("proxy") or obj.get("proxies")
+            if proxy:
+                if isinstance(proxy, dict):
+                    self.proxy = proxy
+                else:
+                    self.proxy = {"http": proxy, "https": proxy}
 
     def getName(self):
         return "IDNFLIX"
@@ -70,7 +98,7 @@ class Spider(BaseSpider):
 
     def _make_id(self, href):
         try:
-            if href.startswith(self.site):
+            if "idnflix.com" in href:
                 p = urlparse(href)
                 path = p.path + (("?" + p.query) if p.query else "")
                 return quote(path, safe="/?=&%")
@@ -78,15 +106,137 @@ class Spider(BaseSpider):
         except Exception:
             return href
 
-    def _get(self, url, headers=None, timeout=15):
+    def _req(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", 20)
+        kwargs.setdefault("verify", False)
+        kwargs.setdefault("allow_redirects", True)
+        if self.proxy:
+            kwargs["proxies"] = self.proxy
+        headers = kwargs.pop("headers", None) or dict(self.site_headers)
         try:
-            return self.session.get(
-                url, headers=headers or self.site_headers,
-                timeout=timeout, allow_redirects=True, verify=False,
-            )
+            if method == "GET":
+                return self.session.get(url, headers=headers, **kwargs)
+            return self.session.post(url, headers=headers, **kwargs)
         except Exception as e:
-            self.log("GET %s" % e)
+            self.log("%s %s" % (method, e))
             return None
+
+    def _is_challenge(self, html):
+        if not html:
+            return False
+        if "One moment, please" in html or "Mohon tunggu" in html:
+            return True
+        if "wsidchk" in html and "/movie/" not in html:
+            return True
+        return False
+
+    def _js_sum(self, g_expr, e_expr):
+        try:
+            import subprocess
+            js = "console.log((%s)+(%s))" % (g_expr, e_expr)
+            return subprocess.check_output(
+                ["node", "-e", js], text=True, stderr=subprocess.DEVNULL, timeout=3
+            ).strip()
+        except Exception:
+            return ""
+
+    def _form_id(self, big, c_hex):
+        try:
+            import subprocess
+            part1 = big.split("var a0X=window")[0]
+            m = re.search(
+                r"function a0J\(\)\{var ([a-z])=\[([\s\S]*?)\];a0J=function\(\)\{return \1;\};return a0J\(\);\}",
+                big,
+            )
+            if not m:
+                return ""
+            code = (
+                part1 + "\n" + m.group(0)
+                + "\nconsole.log('7fa3b767c4'+'60b54a2be4'+a0y(%s)+'c7');\n" % c_hex
+            )
+            return subprocess.check_output(
+                ["node", "-e", code], text=True, stderr=subprocess.DEVNULL, timeout=4
+            ).strip()
+        except Exception as e:
+            self.log("form_id %s" % e)
+            return ""
+
+    def _pass_gate(self, html):
+        """过 One moment 门禁：GET action?wsidchk&pdata&id&ts&cttl → 写 wssplashchk cookie"""
+        try:
+            scripts = re.findall(r"<script>([\s\S]*?)</script>", html)
+            big = next((sc for sc in scripts if len(sc) > 1000 or "wsidchk" in sc), "")
+            if not big:
+                return False
+            g_m = re.search(r"G=(\+\(\(.*?\)\)),J=", html)
+            e_m = re.search(r"E=(\+\(\(.*?\)\)),a=", html)
+            ts_m = re.search(r"'ts','(\d+)'", html)
+            path_m = re.search(r"'(/z0[a-f0-9]+)'", html)
+            pdata_m = re.search(r"k='([^']+)'", html)
+            if not all([g_m, e_m, ts_m, path_m, pdata_m]):
+                return False
+            wsidchk = self._js_sum(g_m.group(1), e_m.group(1))
+            if not wsidchk:
+                return False
+            aw = re.search(r"a0w=\{([^}]+)\}", html)
+            c_hex = "0x169"
+            if aw:
+                cm = re.search(r"c:(0x[0-9a-f]+)", aw.group(1))
+                if cm:
+                    c_hex = cm.group(1)
+            cid = self._form_id(big, c_hex)
+            if not cid:
+                return False
+            params = {
+                "wsidchk": wsidchk,
+                "pdata": unquote(pdata_m.group(1)),
+                "id": cid,
+                "ts": ts_m.group(1),
+                "cttl": "0",
+            }
+            action = self.site + path_m.group(1) + "?" + urlencode(params)
+            headers = dict(self.site_headers)
+            headers["Referer"] = self.site + "/"
+            r = self._req("GET", action, headers=headers)
+            if not r:
+                return False
+            # 成功会带 wssplashchk
+            ck = requests.utils.dict_from_cookiejar(self.session.cookies)
+            if "wssplashchk" in ck:
+                self._gate_ok = True
+                self.log("gate ok cookie set")
+                return True
+            # 再探首页
+            r2 = self._req("GET", self.site + "/", headers=headers)
+            if r2 and not self._is_challenge(r2.text) and "/movie/" in r2.text:
+                self._gate_ok = True
+                self.log("gate ok home")
+                return True
+            self.log("gate fail status=%s" % (r.status_code if r else None))
+            return False
+        except Exception as e:
+            self.log("gate err %s" % e)
+            return False
+
+    def _fetch_html(self, url):
+        headers = dict(self.site_headers)
+        headers["Referer"] = self.site + "/"
+        r = self._req("GET", url, headers=headers)
+        if not r:
+            return ""
+        html = r.text
+        if self._is_challenge(html):
+            if self._pass_gate(html):
+                r = self._req("GET", url, headers=headers)
+                html = r.text if r else ""
+            else:
+                # 再试一次整流程
+                r0 = self._req("GET", self.site + "/", headers=headers)
+                if r0 and self._is_challenge(r0.text):
+                    self._pass_gate(r0.text)
+                r = self._req("GET", url, headers=headers)
+                html = r.text if r else ""
+        return html or ""
 
     def homeContent(self, filter):
         classes = [
@@ -109,29 +259,29 @@ class Spider(BaseSpider):
         return {"class": classes, "filters": {}}
 
     def homeVideoContent(self):
-        r = self._get(self.site + "/")
-        if not r:
+        html = self._fetch_html(self.site + "/")
+        if not html:
             return {"list": []}
-        return {"list": self._parse_items(BeautifulSoup(r.text, "html.parser"), 40)}
+        return {"list": self._parse_items(BeautifulSoup(html, "html.parser"), 40)}
 
     def categoryContent(self, tid, pg, filter, extend):
         base = "%s/%s" % (self.site, tid)
         if str(pg) != "1":
             base += "?page=%s" % pg
-        r = self._get(base)
-        if not r:
+        html = self._fetch_html(base)
+        if not html:
             return {"list": [], "page": 1, "pagecount": 1, "limit": 40, "total": 0}
-        items = self._parse_items(BeautifulSoup(r.text, "html.parser"), 40)
+        items = self._parse_items(BeautifulSoup(html, "html.parser"), 40)
         return {
             "list": items, "page": int(pg), "pagecount": int(pg) + 1,
             "limit": 40, "total": 999999,
         }
 
     def searchContent(self, key, quick, pg="1"):
-        r = self._get("%s/?search=%s" % (self.site, quote(key)))
-        if not r:
+        html = self._fetch_html("%s/?search=%s" % (self.site, quote(key)))
+        if not html:
             return {"list": []}
-        return {"list": self._parse_items(BeautifulSoup(r.text, "html.parser"), 40)}
+        return {"list": self._parse_items(BeautifulSoup(html, "html.parser"), 40)}
 
     def _parse_items(self, soup, limit=40):
         items, seen = [], set()
@@ -164,10 +314,9 @@ class Spider(BaseSpider):
         try:
             path = ids[0] if isinstance(ids, (list, tuple)) else str(ids)
             url = self._abs(unquote(path))
-            r = self._get(url, timeout=18)
-            if not r:
+            html = self._fetch_html(url)
+            if not html:
                 return {"list": []}
-            html = r.text
             soup = BeautifulSoup(html, "html.parser")
 
             title = ""
@@ -225,105 +374,57 @@ class Spider(BaseSpider):
             return {"list": []}
 
     def _build_play_lines(self, raw):
-        """统一改写成 vidlink.pro（蜂蜜可嗅探），并附带备用线路。"""
-        # 兼容多种路径：
-        # /embed/tv/{id}/{s}/{e}  /tv/{id}/{s}/{e}
-        # /embed/movie/{id}       /movie/{id}
-        # ?imdb=tt... /movie/tt...
-        tv_re = re.compile(
-            r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I
-        )
-        movie_re = re.compile(
-            r"(?:/embed)?/movie/([^/?&#]+)", re.I
-        )
+        tv_re = re.compile(r"(?:/embed)?/tv/([^/]+)/(\d+)/(\d+)", re.I)
+        movie_re = re.compile(r"(?:/embed)?/movie/([^/?&#]+)", re.I)
         imdb_re = re.compile(r"(tt\d{5,})", re.I)
-        tmdb_num_re = re.compile(r"(?:tmdb[=/]|/movie/)(\d{3,})", re.I)
-
-        vidlink_eps = []
-        videasy_eps = []
-        vidsrc_eps = []
+        vidlink_eps, videasy_eps, vidsrc_eps = [], [], []
 
         for label, href in raw:
             href = (href or "").replace("&amp;", "&").strip()
             low = href.lower()
-            done = False
 
-            # 已是 vidlink
             if "vidlink.pro" in low:
                 m = tv_re.search(href)
                 if m:
                     tid, s, e = m.group(1), m.group(2), m.group(3)
-                    vidlink_eps.append(
-                        "%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e)
-                    )
-                    videasy_eps.append(
-                        "%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e)
-                    )
-                    done = True
-                else:
-                    m = movie_re.search(href)
-                    if m:
-                        mid = m.group(1)
-                        vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
-                        videasy_eps.append(
-                            "%s$https://player.videasy.net/movie/%s" % (label, mid)
-                        )
-                        done = True
-                if done:
+                    vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
+                    videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
+                    continue
+                m = movie_re.search(href)
+                if m:
+                    mid = m.group(1)
+                    vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
+                    videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
                     continue
 
-            # 剧集
             m = tv_re.search(href)
             if m:
                 tid, s, e = m.group(1), m.group(2), m.group(3)
-                vidlink_eps.append(
-                    "%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e)
-                )
-                videasy_eps.append(
-                    "%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e)
-                )
-                vidsrc_eps.append(
-                    "%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e)
-                )
+                vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
+                videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
+                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e))
                 continue
 
-            # 电影路径
             m = movie_re.search(href)
             if m:
                 mid = m.group(1)
                 vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
                 videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
                 if mid.startswith("tt"):
-                    vidsrc_eps.append(
-                        "%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, mid)
-                    )
+                    vidsrc_eps.append("%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, mid))
                 else:
-                    vidsrc_eps.append(
-                        "%s$https://vidsrc.sh/embed/movie/%s" % (label, mid)
-                    )
+                    vidsrc_eps.append("%s$https://vidsrc.sh/embed/movie/%s" % (label, mid))
                 continue
 
-            # 仅 imdb
             m = imdb_re.search(href)
             if m:
                 imdb = m.group(1)
                 vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, imdb))
                 videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, imdb))
-                vidsrc_eps.append(
-                    "%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, imdb)
-                )
+                vidsrc_eps.append("%s$https://vidsrc2.ru/embed/movie?imdb=%s" % (label, imdb))
                 continue
 
-            # tmdb 数字
-            m = tmdb_num_re.search(href)
-            if m:
-                mid = m.group(1)
-                vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
-                videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
-                continue
-
-            # 未知：若已是可嗅探域名仍放进 Vidlink 组
-            if any(x in low for x in ("vidlink", "videasy")):
+            if "vidlink" in low or "videasy" in low:
                 vidlink_eps.append("%s$%s" % (label, href))
             else:
                 vidsrc_eps.append("%s$%s" % (label, href))
@@ -342,25 +443,15 @@ class Spider(BaseSpider):
             url = unquote(str(id)).strip()
             if not url.startswith("http"):
                 url = self._abs(url)
-
             if self.isVideoFormat(url):
                 return {
-                    "parse": 0,
-                    "jx": 0,
-                    "url": url,
-                    "header": {
-                        "User-Agent": self.ua,
-                        "Referer": "https://vidlink.pro/",
-                    },
+                    "parse": 0, "jx": 0, "url": url,
+                    "header": {"User-Agent": self.ua, "Referer": "https://vidlink.pro/"},
                 }
-
             low = url.lower()
-            # vidlink / videasy：蜂蜜嗅探可播
             if "vidlink.pro" in low:
                 return {
-                    "parse": 1,
-                    "jx": 0,
-                    "url": url,
+                    "parse": 1, "jx": 0, "url": url,
                     "header": {
                         "User-Agent": self.ua,
                         "Referer": "https://vidlink.pro/",
@@ -369,32 +460,16 @@ class Spider(BaseSpider):
                 }
             if "videasy" in low:
                 return {
-                    "parse": 1,
-                    "jx": 0,
-                    "url": url,
-                    "header": {
-                        "User-Agent": self.ua,
-                        "Referer": "https://player.videasy.net/",
-                    },
+                    "parse": 1, "jx": 0, "url": url,
+                    "header": {"User-Agent": self.ua, "Referer": "https://player.videasy.net/"},
                 }
-
-            # 其它 embed 也走嗅探
             return {
-                "parse": 1,
-                "jx": 0,
-                "url": url,
-                "header": {
-                    "User-Agent": self.ua,
-                    "Referer": self.site + "/",
-                },
+                "parse": 1, "jx": 0, "url": url,
+                "header": {"User-Agent": self.ua, "Referer": self.site + "/"},
             }
         except Exception as e:
             self.log("player %s" % e)
-            return {
-                "parse": 1,
-                "url": str(id),
-                "header": {"User-Agent": self.ua},
-            }
+            return {"parse": 1, "url": str(id), "header": {"User-Agent": self.ua}}
 
     def localProxy(self, param):
         try:
@@ -403,12 +478,8 @@ class Spider(BaseSpider):
                 return [400, "text/plain", b"missing"]
             r = self.session.get(
                 url, headers={"User-Agent": self.ua},
-                timeout=20, verify=False,
+                timeout=20, verify=False, proxies=self.proxy,
             )
-            return [
-                r.status_code,
-                r.headers.get("Content-Type", "application/octet-stream"),
-                r.content,
-            ]
+            return [r.status_code, r.headers.get("Content-Type", "application/octet-stream"), r.content]
         except Exception as e:
             return [500, "text/plain", str(e).encode()]
