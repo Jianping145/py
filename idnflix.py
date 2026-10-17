@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# IDNFLIX Spider v8.3 - 蜂蜜影视
+# IDNFLIX Spider v8.4 - 蜂蜜影视
 # 自动过 wssplash 门禁（GET + wsidchk），播放优先 vidlink.pro 嗅探
 # extend 可选代理: {"proxy":"http://127.0.0.1:7890"}
 import re
@@ -431,17 +431,26 @@ class Spider(BaseSpider):
         vidlink_eps, videasy_eps, vidsrc_eps = [], [], []
         rumble_eps, youtube_eps, dailymotion_eps = [], [], []
 
+        embed2_eps = []  # 2embed 对蜂蜜沙箱更友好
+
         def add_tv(label, tid, s, e, keep_href=None):
-            vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, int(s), int(e)))
-            videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, int(s), int(e)))
+            s, e = int(s), int(e)
+            # Videasy 优先（Vidlink 在沙箱 WebView 常被拦截）
+            videasy_eps.append("%s$https://player.videasy.net/tv/%s/%s/%s" % (label, tid, s, e))
+            embed2_eps.append("%s$https://www.2embed.cc/embedtv/%s&s=%s&e=%s" % (label, tid, s, e))
+            vidlink_eps.append("%s$https://vidlink.pro/tv/%s/%s/%s" % (label, tid, s, e))
             if keep_href:
                 vidsrc_eps.append("%s$%s" % (label, keep_href))
             else:
-                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, int(s), int(e)))
+                vidsrc_eps.append("%s$https://vidsrc.sh/embed/tv/%s/%s/%s" % (label, tid, s, e))
 
         def add_movie(label, mid, keep_href=None):
-            vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
             videasy_eps.append("%s$https://player.videasy.net/movie/%s" % (label, mid))
+            if str(mid).startswith("tt"):
+                embed2_eps.append("%s$https://www.2embed.cc/embed/%s" % (label, mid))
+            else:
+                embed2_eps.append("%s$https://www.2embed.cc/embed/tmdb/%s" % (label, mid))
+            vidlink_eps.append("%s$https://vidlink.pro/movie/%s" % (label, mid))
             if keep_href:
                 vidsrc_eps.append("%s$%s" % (label, keep_href))
             elif str(mid).startswith("tt"):
@@ -605,12 +614,36 @@ class Spider(BaseSpider):
         if videasy_eps and imdb:
             videasy_eps = sorted(videasy_eps, key=_ep_key)
 
-        lines = []
-        # 清晰度优先：Videasy / Vidlink 在前，Rumble 在后
+        # 分集升序（S01E01 在前）
+        def _se_key(item):
+            lab = item.split("$")[0]
+            mm = se_label_re.search(lab)
+            if mm:
+                return (int(mm.group(1)), int(mm.group(2)))
+            mm = ep_num_re.search(lab)
+            return (0, int(mm.group(1))) if mm else (0, 0)
+
+        for lst_name in ("videasy_eps", "embed2_eps", "vidlink_eps", "vidsrc_eps"):
+            lst = locals().get(lst_name) or []
+            if lst and any(se_label_re.search(x.split("$")[0]) or ep_num_re.search(x.split("$")[0]) for x in lst):
+                locals()[lst_name]  # no-op
+        if videasy_eps:
+            videasy_eps = sorted(videasy_eps, key=_se_key)
+        if embed2_eps:
+            embed2_eps = sorted(embed2_eps, key=_se_key)
         if vidlink_eps:
-            lines.append(("Vidlink", "#".join(vidlink_eps)))
+            vidlink_eps = sorted(vidlink_eps, key=_se_key)
+        if vidsrc_eps:
+            vidsrc_eps = sorted(vidsrc_eps, key=_se_key)
+
+        lines = []
+        # Vidlink 在蜂蜜沙箱 WebView 常被其自身检测拦截，故排后
         if videasy_eps:
             lines.append(("Videasy", "#".join(videasy_eps)))
+        if embed2_eps:
+            lines.append(("2Embed", "#".join(embed2_eps)))
+        if vidlink_eps:
+            lines.append(("Vidlink", "#".join(vidlink_eps)))
         if rumble_eps:
             lines.append(("Rumble", "#".join(rumble_eps)))
         if dailymotion_eps:
@@ -664,6 +697,11 @@ class Spider(BaseSpider):
                 return {
                     "parse": 1, "jx": 0, "url": url,
                     "header": {"User-Agent": self.ua, "Referer": "https://www.dailymotion.com/"},
+                }
+            if "2embed" in low:
+                return {
+                    "parse": 1, "jx": 0, "url": url,
+                    "header": {"User-Agent": self.ua, "Referer": "https://www.2embed.cc/"},
                 }
             return {
                 "parse": 1, "jx": 0, "url": url,
