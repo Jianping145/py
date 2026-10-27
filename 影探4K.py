@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 import re, sys, json, base64
 from Crypto.Cipher import AES
-from urllib.parse import urljoin, quote, unquote
+from urllib.parse import urljoin, quote
 from Crypto.Util.Padding import unpad
 from base.spider import Spider
 
@@ -9,14 +10,13 @@ sys.path.append('..')
 
 class Spider(Spider):
     headers = {'User-Agent': 'okhttp/4.12.0'}
-    # 解析接口请求头(与 PHP 端一致)
     parse_headers = {'User-Agent': 'okhttp-okgo/jeasonlzy'}
 
     FIXED_CONFIG = {
         'host': 'http://cms.lyyytv.cn',
         'cmskey': 'wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy',
         'RawPlayUrl': 0,
-        # 原 ldmax 解析接口已失效，保留字段方便以后替换
+        # 原解析接口已失效，保留方便以后替换
         'parse_api': 'http://61.184.23.217:6163/api/index?parsesId=4&appid=10001&videoUrl='
     }
 
@@ -24,18 +24,11 @@ class Spider(Spider):
         self.host = self.FIXED_CONFIG['host']
         self.cmskey = self.FIXED_CONFIG.get('cmskey', '')
         self.parse_api = self.FIXED_CONFIG.get('parse_api', '')
-        raw_play_url = self.FIXED_CONFIG.get('RawPlayUrl', 0)
-        if raw_play_url == 1:
-            self.raw_play_url = 1
-        else:
-            self.raw_play_url = 0
+        self.raw_play_url = 1 if self.FIXED_CONFIG.get('RawPlayUrl', 0) == 1 else 0
 
     def ldmax_decrypt(self, encrypted_base64, depth=0):
-        # 对应 PHP 的 LdmaxDecryptor::decrypt,递归解密 ldmax.cooom 加密链接
         if depth > 5:
             return None
-        # 严格 base64 解码(对应 PHP base64_decode 第二参 true),
-        # 非法 base64(如明文URL)直接原样返回
         cleaned = re.sub(r'\s+', '', encrypted_base64)
         try:
             decoded = base64.b64decode(cleaned, validate=True).decode('utf-8', errors='ignore')
@@ -68,14 +61,12 @@ class Spider(Spider):
         return result
 
     def ldmax_parse(self, video_url):
-        # 对应 PHP 主流程:解密 -> 调用解析接口 -> 二次解密
-        # 当前解析接口已挂，直接返回 None，让后续走外置解析
         decrypted = self.ldmax_decrypt(video_url)
         if not decrypted or not re.match(r'^https?://', decrypted):
             return None
         try:
             parse_url = self.parse_api + quote(decrypted, safe='')
-            resp = self.fetch(parse_url, headers=self.parse_headers, timeout=15).json()
+            resp = self.fetch(parse_url, headers=self.parse_headers, timeout=12).json()
         except Exception:
             return None
         if not resp or resp.get('code') != 200 or not resp.get('url'):
@@ -88,8 +79,8 @@ class Spider(Spider):
     def homeVideoContent(self):
         data = self.fetch(f"{self.host}/api.php/app/index_video?token=", headers=self.headers).json()
         videos = []
-        for item in data['list']:
-            videos.extend(item['vlist'])
+        for item in data.get('list', []):
+            videos.extend(item.get('vlist', []))
         return {'list': videos}
 
     def homeContent(self, filter):
@@ -98,13 +89,13 @@ class Spider(Spider):
         filters = {}
         classes = []
 
-        for item in data['list']:
+        for item in data.get('list', []):
             has_non_empty_field = False
-            jsontype_extend = item["type_extend"]
+            jsontype_extend = item.get("type_extend") or {}
             classes.append({"type_name": item["type_name"], "type_id": item["type_id"]})
 
             for key in keys:
-                if key in jsontype_extend and jsontype_extend[key].strip() != "":
+                if key in jsontype_extend and str(jsontype_extend[key]).strip() != "":
                     has_non_empty_field = True
                     break
 
@@ -112,23 +103,15 @@ class Spider(Spider):
                 filters[str(item["type_id"])] = []
 
             for dkey in jsontype_extend:
-                if dkey in keys and jsontype_extend[dkey].strip() != "":
-                    values = jsontype_extend[dkey].split(",")
-                    value_array = []
-                    for value in values:
-                        if value.strip() != "":
-                            value_array.append({"n": value.strip(), "v": value.strip()})
+                if dkey in keys and str(jsontype_extend[dkey]).strip() != "":
+                    values = str(jsontype_extend[dkey]).split(",")
+                    value_array = [{"n": v.strip(), "v": v.strip()} for v in values if v.strip()]
                     filters[str(item["type_id"])].append({"key": dkey, "name": dkey, "value": value_array})
 
         return {"class": classes, "filters": filters}
 
     def categoryContent(self, tid, pg, filter, extend):
-        # 构建URL查询参数
-        query_params = [
-            f"tid={tid}",
-            f"pg={pg}",
-            f"limit=18"
-        ]
+        query_params = [f"tid={tid}", f"pg={pg}", "limit=18"]
         if extend.get('class'):
             query_params.append(f"class={extend.get('class')}")
         if extend.get('area'):
@@ -144,8 +127,8 @@ class Spider(Spider):
 
     def searchContent(self, key, quick, pg="1"):
         data = self.fetch(f"{self.host}/api.php/app/search?text={key}&pg={pg}", headers=self.headers).json()
-        videos = data['list']
-        for item in data['list']:
+        videos = data.get('list', [])
+        for item in videos:
             item.pop('type', None)
         return {'list': videos, 'page': pg}
 
@@ -153,7 +136,7 @@ class Spider(Spider):
         data = self.fetch(f"{self.host}/api.php/app/video_detail?id={ids[0]}", headers=self.headers).json()['data']
         show, paly_urls = [], []
 
-        for i in data['vod_url_with_player']:
+        for i in data.get('vod_url_with_player', []):
             urls = i['url'].split('#')
             urls2 = []
             for j in urls:
@@ -161,65 +144,54 @@ class Spider(Spider):
                     url = j.split('$', 1)
                     urls2.append(f"{url[0]}${self.lvdou(url[1])}")
             paly_urls.append('#'.join(urls2))
-
             show.append(i['name'].strip())
 
-        data.pop('vod_url_with_player')
+        data.pop('vod_url_with_player', None)
         data['vod_play_from'] = '$$$'.join(show)
         data['vod_play_url'] = '$$$'.join(paly_urls)
         return {'list': [data]}
 
     def playerContent(self, flag, video_id, vipFlags):
-        # 修复1：只清除明确错误的编码（如 %26 代替 &），保留正常的中文百分号编码
-        # 原来的全局 re.sub(r'%[0-9A-Fa-f]{2}', '', video_id) 会把中文文件名直接删掉导致 404
+        # 只清理明确错误的编码，保留正常中文百分号编码
         video_id = video_id.replace('%26', '&').replace('%20', ' ')
-        # 可选：如果发现被错误双重编码，再做一次 unquote（按需打开）
-        # video_id = unquote(video_id)
 
-        is_plain_url = video_id.startswith(('http://', 'https://'))
-        is_lyyy = is_plain_url and 'lyyytv.cn' in video_id
+        is_plain = video_id.startswith(('http://', 'https://'))
+        is_lyyy = is_plain and 'lyyytv.cn' in video_id
+        is_direct = self.check_paly_url(video_id)
 
-        # 需要内置解析的情况:
-        # 1. 非明文URL(base64密文等)
-        # 2. 本站域名URL(lyyytv.cn 伪直链)
-        if (not is_plain_url) or is_lyyy:
+        # 1. 尝试内置 ldmax 解析（针对加密或本站伪直链）
+        if (not is_plain) or is_lyyy:
             parsed = self.ldmax_parse(video_id)
-            if parsed:
+            if parsed and parsed.get('url'):
                 return {
-                    'jx': 0,
                     'parse': 0,
+                    'jx': 0,
                     'playUrl': '',
                     'url': parsed['url'],
                     'header': self.headers
                 }
-            # 修复2：内置解析失败后，不再把伪直链当成可播地址
-            # 直接交给 TVBox 外置解析（jx=1），避免返回 404 的假链接
-            if is_lyyy:
-                return {
-                    'jx': 1,
-                    'parse': 0,
-                    'playUrl': '',
-                    'url': video_id,
-                    'header': self.headers
-                }
 
-        # 真正的直链(mp4/m3u8 等)直接播放
-        if self.check_paly_url(video_id):
+        # 2. 真正的媒体直链 → 直接播放
+        if is_direct:
             return {
-                'jx': 0,
                 'parse': 0,
+                'jx': 0,
                 'playUrl': '',
                 'url': video_id,
                 'header': self.headers
             }
 
-        # 其他情况交给 tvbox 外置解析
+        # 3. 其他情况（官方分享页 / 伪直链解析失败）→ 强制走嗅探/解析
+        # 蜂蜜影视必须靠 parse=1 才会真正进入 WebView 嗅探，只写 jx=1 经常直接跳过
         return {
+            'parse': 1,          # 关键：强制解析/嗅探
             'jx': 1,
             'playUrl': '',
-            'parse': 0,
             'url': video_id,
-            'header': self.headers
+            'header': {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+                'Referer': video_id.split('/')[0] + '//' + video_id.split('/')[2] + '/' if is_plain else ''
+            }
         }
 
     def lvdou(self, text):
@@ -237,34 +209,32 @@ class Spider(Spider):
                 return unpad(pt_bytes, AES.block_size).decode('utf-8')
             except Exception:
                 return original_text
-        else:
-            return original_text
+        return original_text
 
     def raw_url(self, original_url):
         try:
-            response = self.fetch(original_url, allow_redirects=False, stream=True, timeout=20)
+            response = self.fetch(original_url, allow_redirects=False, stream=True, timeout=15)
             if 300 <= response.status_code < 400:
-                redirect_location = response.headers.get('Location')
-                if redirect_location:
-                    real_url = urljoin(original_url, redirect_location)
-                    return real_url
+                loc = response.headers.get('Location')
+                if loc:
+                    return urljoin(original_url, loc)
             return original_url
         except Exception:
             return original_url
 
     def check_paly_url(self, content):
-        # 修复3：去掉 lyyytv.cn 匹配，避免把伪直链当成真正可播地址
-        pattern = r"https?://.*\.(?:mp4|m3u8|flv|avi|mkv|ts|mov|wmv|webm)(?:\?|$|&)"
+        # 严格匹配真实媒体后缀，不再把 lyyytv.cn 当成直链
+        pattern = r'https?://[^\s"\']+\.(?:mp4|m3u8|flv|avi|mkv|ts|mov|wmv|webm)(?:\?|$|&|#)'
         return bool(re.search(pattern, content, re.IGNORECASE))
 
     def getName(self):
-        pass
+        return '影探4K'
 
     def localProxy(self, param):
         pass
 
     def isVideoFormat(self, url):
-        pass
+        return self.check_paly_url(url)
 
     def manualVideoCheck(self):
         pass
