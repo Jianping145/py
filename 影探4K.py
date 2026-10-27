@@ -1,6 +1,6 @@
 import re, sys, json, base64
 from Crypto.Cipher import AES
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, unquote
 from Crypto.Util.Padding import unpad
 from base.spider import Spider
 
@@ -16,7 +16,7 @@ class Spider(Spider):
         'host': 'http://cms.lyyytv.cn',
         'cmskey': 'wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy',
         'RawPlayUrl': 0,
-        # ldmax 内置解析接口
+        # 原 ldmax 解析接口已失效，保留字段方便以后替换
         'parse_api': 'http://61.184.23.217:6163/api/index?parsesId=4&appid=10001&videoUrl='
     }
 
@@ -69,12 +69,13 @@ class Spider(Spider):
 
     def ldmax_parse(self, video_url):
         # 对应 PHP 主流程:解密 -> 调用解析接口 -> 二次解密
+        # 当前解析接口已挂，直接返回 None，让后续走外置解析
         decrypted = self.ldmax_decrypt(video_url)
         if not decrypted or not re.match(r'^https?://', decrypted):
             return None
         try:
             parse_url = self.parse_api + quote(decrypted, safe='')
-            resp = self.fetch(parse_url, headers=self.parse_headers, timeout=30).json()
+            resp = self.fetch(parse_url, headers=self.parse_headers, timeout=15).json()
         except Exception:
             return None
         if not resp or resp.get('code') != 200 or not resp.get('url'):
@@ -169,22 +170,57 @@ class Spider(Spider):
         return {'list': [data]}
 
     def playerContent(self, flag, video_id, vipFlags):
-        # 移除URL中的百分号编码（如 %26 %20 等），直接删除而非解码
-        # 例: 04.国%26粤.mp4 → 04.国粤.mp4
-        video_id = re.sub(r'%[0-9A-Fa-f]{2}', '', video_id)
+        # 修复1：只清除明确错误的编码（如 %26 代替 &），保留正常的中文百分号编码
+        # 原来的全局 re.sub(r'%[0-9A-Fa-f]{2}', '', video_id) 会把中文文件名直接删掉导致 404
+        video_id = video_id.replace('%26', '&').replace('%20', ' ')
+        # 可选：如果发现被错误双重编码，再做一次 unquote（按需打开）
+        # video_id = unquote(video_id)
+
+        is_plain_url = video_id.startswith(('http://', 'https://'))
+        is_lyyy = is_plain_url and 'lyyytv.cn' in video_id
+
         # 需要内置解析的情况:
         # 1. 非明文URL(base64密文等)
-        # 2. 本站域名URL(lyyytv.cn 伪直链,需经 parse_api 二次解析才能拿到真实播放地址)
-        is_plain_url = video_id.startswith(('http://', 'https://'))
-        if (not is_plain_url) or (is_plain_url and 'lyyytv.cn' in video_id):
+        # 2. 本站域名URL(lyyytv.cn 伪直链)
+        if (not is_plain_url) or is_lyyy:
             parsed = self.ldmax_parse(video_id)
             if parsed:
-                return {'jx': 0, 'parse': 0, 'playUrl': '', 'url': parsed['url'], 'header': self.headers}
+                return {
+                    'jx': 0,
+                    'parse': 0,
+                    'playUrl': '',
+                    'url': parsed['url'],
+                    'header': self.headers
+                }
+            # 修复2：内置解析失败后，不再把伪直链当成可播地址
+            # 直接交给 TVBox 外置解析（jx=1），避免返回 404 的假链接
+            if is_lyyy:
+                return {
+                    'jx': 1,
+                    'parse': 0,
+                    'playUrl': '',
+                    'url': video_id,
+                    'header': self.headers
+                }
+
         # 真正的直链(mp4/m3u8 等)直接播放
         if self.check_paly_url(video_id):
-            return {'jx': 0, 'parse': 0, 'playUrl': '', 'url': video_id, 'header': self.headers}
+            return {
+                'jx': 0,
+                'parse': 0,
+                'playUrl': '',
+                'url': video_id,
+                'header': self.headers
+            }
+
         # 其他情况交给 tvbox 外置解析
-        return {'jx': 1, 'playUrl': '', 'parse': 0, 'url': video_id, 'header': self.headers}
+        return {
+            'jx': 1,
+            'playUrl': '',
+            'parse': 0,
+            'url': video_id,
+            'header': self.headers
+        }
 
     def lvdou(self, text):
         key = self.cmskey[:16].encode("utf-8")
@@ -217,7 +253,8 @@ class Spider(Spider):
             return original_url
 
     def check_paly_url(self, content):
-        pattern = r"https?://.*(?:\.(?:mp4|m3u8|flv|avi|mkv|ts|mov|wmv|webm)|lyyytv\.cn/)"
+        # 修复3：去掉 lyyytv.cn 匹配，避免把伪直链当成真正可播地址
+        pattern = r"https?://.*\.(?:mp4|m3u8|flv|avi|mkv|ts|mov|wmv|webm)(?:\?|$|&)"
         return bool(re.search(pattern, content, re.IGNORECASE))
 
     def getName(self):
